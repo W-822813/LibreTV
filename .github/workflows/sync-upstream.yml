@@ -1,0 +1,33 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "30 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  merge-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Merge upstream main
+        run: |
+          git remote add upstream https://github.com/LibreSpark/LibreTV.git
+          git fetch upstream main
+          if git merge --no-edit upstream/main; then
+            git push origin main
+            echo "已同步上游最新提交"
+          else
+            git merge --abort
+            echo "::warning::上游与本仓库存在冲突，本次自动同步已跳过，请手动处理"
+          fi
