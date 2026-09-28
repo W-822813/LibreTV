@@ -4,10 +4,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/client-api';
 import type { SourceConfig, SearchResultItem } from '@/lib/types';
-import { buildImageUrl, buildWatchUrl, cn } from '@/lib/utils';
+import { buildWatchUrl, cn } from '@/lib/utils';
 import { useAppStore, resolveSource } from '@/lib/store';
 import { useToast } from './toast';
 import { Icon } from './icon';
+import { SmartImage } from './smart-image';
 import { EmptyState, LoadingState } from './states';
 import { useFocusTrap } from './use-focus-trap';
 
@@ -206,7 +207,7 @@ export function SwitchSourceModal({
             {sorted.map((c) => {
               const isCurrent = c.source.key === currentSourceKey && String(c.result.vodId) === String(currentVodId);
               const cardKey = `${c.source.key}_${c.result.vodId}`;
-              const img = buildImageUrl(c.result.pic, store.imageProxyMode, store.customImageProxy);
+              const img = c.result.pic;
               const coverFailed = imgFailed[cardKey] ?? false;
               return (
                 <button
@@ -217,13 +218,13 @@ export function SwitchSourceModal({
                 >
                   <div className="relative aspect-[2/3] bg-chip">
                     {img && !coverFailed ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={img}
+                      <SmartImage
+                        url={c.result.pic}
+                        mode={store.imageProxyMode}
+                        customProxy={store.customImageProxy}
                         alt={c.result.name}
                         className="w-full h-full object-cover"
-                        loading="lazy"
-                        onError={() => setImgFailed((prev) => ({ ...prev, [cardKey]: true }))}
+                        onExhausted={() => setImgFailed((prev) => ({ ...prev, [cardKey]: true }))}
                       />
                     ) : (
                       <div className="w-full h-full flex items-center justify-center text-faint">

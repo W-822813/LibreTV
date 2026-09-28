@@ -5,6 +5,7 @@ import { cn, formatDisableTtl } from '@/lib/utils';
 import { isInDisabledSubscription, useAppStore } from '@/lib/store';
 import { useToast } from './toast';
 import { Icon } from './icon';
+import { Dropdown, type DropdownOption } from './dropdown';
 import { Spinner } from './states';
 
 /**
@@ -115,38 +116,38 @@ export function Switch({
   );
 }
 
+/**
+ * 设置行下拉：自定义样式的下拉组件（见 Dropdown），替代原生 <select>——
+ * 原生展开面板由操作系统渲染，与站点风格割裂且暗色模式下突兀；
+ * 选中的详细说明由调用方经 description 随选项动态展示（对齐 ToggleRow 的布局）。
+ */
 export function SelectRow({
   label,
   value,
   onChange,
   options,
+  description,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
-  options: { value: string; label: string }[];
+  options: DropdownOption[];
+  /** 当前选中项的说明文案，随选中项变化 */
+  description?: string;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4">
-      <span className="text-sm text-content shrink-0">{label}</span>
-      <div className="relative min-w-0">
-        <select
-          className="input !py-1.5 !pl-2.5 !pr-7 cursor-pointer appearance-none text-xs max-w-full"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          aria-label={label}
-        >
-          {options.map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.label}
-            </option>
-          ))}
-        </select>
-        <Icon
-          name="chevronDown"
-          className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-faint"
-        />
+    <div className="flex items-center justify-between gap-4 py-0.5">
+      <div className="min-w-0">
+        <div className="text-sm text-content">{label}</div>
+        {description && <div className="text-xs text-faint">{description}</div>}
       </div>
+      <Dropdown
+        value={value}
+        onChange={onChange}
+        options={options}
+        ariaLabel={label}
+        className="shrink-0 [&>button]:!py-1.5 [&>button]:!pl-2.5 [&>button]:!pr-2 [&>button]:text-xs"
+      />
     </div>
   );
 }

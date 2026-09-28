@@ -23,6 +23,8 @@ export interface AppSettings {
   recommendSourceTouched: boolean;
   autoplayNext: boolean;
   imageProxyMode: 'direct' | 'proxy' | 'custom';
+  /** 用户是否在设置中主动选择过封面图加载方式；为 false 时部署者的 DEFAULT_IMAGE_MODE 默认值可生效 */
+  imageProxyModeTouched: boolean;
   customImageProxy: string;
 }
 
@@ -293,7 +295,11 @@ export const useAppStore = create<AppState>()(
       recommendSource: 'hot-list',
       recommendSourceTouched: false,
       autoplayNext: true,
-      imageProxyMode: 'proxy',
+      // 直连优先：豆瓣封面有公共镜像 + 内置代理两级兜底（见 buildImageCandidates），
+      // 默认省服务器流量；老用户保持已持久化的选择不受影响。
+      // 部署者可用 DEFAULT_IMAGE_MODE=proxy 下发内置代理优先（最稳定，吃服务器流量）
+      imageProxyMode: 'direct',
+      imageProxyModeTouched: false,
       customImageProxy: '',
 
       addCustomApi: (api) => {
@@ -703,9 +709,10 @@ export const useAppStore = create<AppState>()(
       },
 
       updateSettings: (patch) => {
-        // 用户主动修改推荐数据源时打上「已选择」标记：此后部署者的
-        // DEFAULT_RECOMMEND_SOURCE 默认值不再覆盖该用户的选择
+        // 用户主动修改推荐数据源 / 封面图加载方式时打上「已选择」标记：此后部署者的
+        // DEFAULT_RECOMMEND_SOURCE / DEFAULT_IMAGE_MODE 默认值不再覆盖该用户的选择
         const touched = 'recommendSource' in patch;
+        const imageTouched = 'imageProxyMode' in patch;
         // 打开成人内容过滤时，同步取消勾选所有成人源，避免两者并存
         if (patch.yellowFilter === true) {
           const adultKeys = new Set(
@@ -716,11 +723,16 @@ export const useAppStore = create<AppState>()(
           set({
             ...patch,
             ...(touched ? { recommendSourceTouched: true } : null),
+            ...(imageTouched ? { imageProxyModeTouched: true } : null),
             selectedKeys: get().selectedKeys.filter((k) => !adultKeys.has(k)),
           });
           return;
         }
-        set(touched ? { ...patch, recommendSourceTouched: true } : patch);
+        set({
+          ...patch,
+          ...(touched ? { recommendSourceTouched: true } : null),
+          ...(imageTouched ? { imageProxyModeTouched: true } : null),
+        });
       },
     }),
     {
@@ -776,6 +788,7 @@ export const useAppStore = create<AppState>()(
         recommendSourceTouched: s.recommendSourceTouched,
         autoplayNext: s.autoplayNext,
         imageProxyMode: s.imageProxyMode,
+        imageProxyModeTouched: s.imageProxyModeTouched,
         customImageProxy: s.customImageProxy,
       }),
       // 同步 storage 会在模块加载时立即 rehydrate（早于 React hydration），

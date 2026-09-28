@@ -6,6 +6,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import { ThemeToggle } from './theme';
 import { SourceManagerDrawer } from './source-manager';
 import { HistoryPanel } from './history-panel';
+import { requestShowDownloadManager } from './download-manager';
 import { Icon } from './icon';
 import { SearchHistoryDropdown, useSearchHistory } from './search-history';
 import { cn } from '@/lib/utils';
@@ -105,6 +106,9 @@ export function Header({ showSearch = false }: { showSearch?: boolean }) {
             <ThemeToggle />
             <IconButton label="观看历史" onClick={() => setHistoryOpen(true)}>
               <Icon name="clock" />
+            </IconButton>
+            <IconButton label="下载管理" onClick={requestShowDownloadManager}>
+              <Icon name="download" />
             </IconButton>
             <IconButton label="设置" onClick={() => setSettingsOpen(true)}>
               <Icon name="gear" />

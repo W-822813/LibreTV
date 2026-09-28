@@ -3,7 +3,14 @@
 import { useEffect, useRef, useState } from 'react';
 import Artplayer from 'artplayer';
 import Hls, { type HlsConfig } from 'hls.js';
-import { filterAdsFromM3u8 } from '@/lib/m3u8';
+
+import { PlaybackRecovery, describeHlsError } from '@/lib/playback-recovery';
+import { createHlsLoader } from '@/lib/hls-loader';
+import {
+  getVideoPrefetcher,
+  getNextEpisodePrefetcher,
+} from '@/lib/video-prefetcher';
+import { loadCacheSettings } from '@/lib/video-cache';
 import { formatTime } from '@/lib/utils';
 
 /**
@@ -12,39 +19,23 @@ import { formatTime } from '@/lib/utils';
  * 移除：DOM 手工操作、watch.html 跳转链、localStorage 状态总线。
  */
 
-// 广告过滤 loader：拦截 manifest/level 响应文本，剔除 DISCONTINUITY 广告片段
-class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  constructor(config: any) {
-    super(config);
-    const load = this.load.bind(this);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- hls.js loader 回调签名未导出精确类型
-    this.load = function (context: any, config: any, callbacks: any) {
-      if (context.type === 'manifest' || context.type === 'level') {
-        const onSuccess = callbacks.onSuccess;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        callbacks.onSuccess = function (response: any, stats: any, ctx: any, networkDetails: any) {
-          if (response.data && typeof response.data === 'string') {
-            response.data = filterAdsFromM3u8(response.data);
-          }
-          return onSuccess(response, stats, ctx, networkDetails);
-        };
-      }
-      load(context, config, callbacks);
-    };
-  }
-}
-
 interface PlayerShellProps {
   url: string;
   title: string;
   adFilter: boolean;
   autoplayNext: boolean;
+  /** 剧集标识 `${source}:${vodId}:${episodeIndex}`（片段缓存按集淘汰的分组键） */
+  episodeKey?: string;
+  /** 下一集 m3u8 地址：当前集预取完成后预热下一集前 7 分钟 */
+  nextUrl?: string;
+  nextEpisodeKey?: string;
   /** 进度恢复：优先 URL position，其次查询该回调（返回 0 表示无记录） */
   getRestorePosition?: () => number | Promise<number>;
   onTimeUpdate?: (position: number, duration: number) => void;
   onEnded?: () => void;
   onPause?: (position: number, duration: number) => void;
+  /** 恢复策略判源不可用（重试耗尽/格式硬失败）时回调：父级弹出换源面板 */
+  onRequestSwitchSource?: (reason: string) => void;
 }
 
 export function PlayerShell({
@@ -52,10 +43,14 @@ export function PlayerShell({
   title,
   adFilter,
   autoplayNext,
+  episodeKey,
+  nextUrl,
+  nextEpisodeKey,
   getRestorePosition,
   onTimeUpdate,
   onEnded,
   onPause,
+  onRequestSwitchSource,
 }: PlayerShellProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -67,8 +62,8 @@ export function PlayerShell({
   const [showPoster, setShowPoster] = useState(true);
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 用 ref 持有最新回调，避免重建播放器
-  const cbs = useRef({ onTimeUpdate, onEnded, onPause, getRestorePosition });
-  cbs.current = { onTimeUpdate, onEnded, onPause, getRestorePosition };
+  const cbs = useRef({ onTimeUpdate, onEnded, onPause, getRestorePosition, onRequestSwitchSource });
+  cbs.current = { onTimeUpdate, onEnded, onPause, getRestorePosition, onRequestSwitchSource };
   const autoplayRef = useRef(autoplayNext);
   autoplayRef.current = autoplayNext;
 
@@ -83,9 +78,11 @@ export function PlayerShell({
     const mountCbs = { onTimeUpdate, onEnded, onPause, getRestorePosition };
 
     let lastSave = 0;
+    let lastPrefetchEnsure = 0;
     let playbackStarted = false;
-    let errorCount = 0;
     let ended = false;
+    // 本集的恢复策略实例：跨直连/代理两级重建共享计数，换集随 effect 重建
+    const recovery = new PlaybackRecovery();
 
     const showHint = (text: string) => {
       setHint(text);
@@ -93,13 +90,16 @@ export function PlayerShell({
       hintTimerRef.current = setTimeout(() => setHint(''), 2500);
     };
 
+    // 片段缓存开启时调大 hls.js 自身缓冲，缓冲之外的空窗由预取器补齐
+    const cacheSettings = loadCacheSettings();
+    const cacheEnabled = cacheSettings.enabled && !!episodeKey;
     const hlsConfig: Partial<HlsConfig> = {
       debug: false,
       enableWorker: true,
       backBufferLength: 90,
-      maxBufferLength: 30,
-      maxMaxBufferLength: 60,
-      maxBufferSize: 30 * 1000 * 1000,
+      maxBufferLength: cacheEnabled ? 120 : 30,
+      maxMaxBufferLength: cacheEnabled ? 600 : 60,
+      maxBufferSize: (cacheEnabled ? 90 : 30) * 1000 * 1000,
       maxBufferHole: 0.5,
       fragLoadingMaxRetry: 6,
       fragLoadingRetryDelay: 1000,
@@ -108,13 +108,36 @@ export function PlayerShell({
       startLevel: -1,
       abrEwmaDefaultEstimate: 500_000,
       appendErrorMaxRetry: 5,
+      // 组合 loader：广告过滤（blockAd 随设置）+ 片段缓存命中（cacheEnabled）
+      loader: createHlsLoader(Hls, { blockAd: adFilter }) as unknown as HlsConfig['loader'],
     };
-    if (adFilter) hlsConfig.loader = CustomHlsJsLoader as unknown as HlsConfig['loader'];
 
     /**
      * 初始化 HLS。allowProxyFallback：直连致命网络错误（CORS/防盗链/分片被拒）时，
      * 自动改走同源 cookie 鉴权的 /api/proxy 重试一次。
      */
+    // 当前集预取（episodeKey 缺省 = 关闭，见 ensure 内部 settings.enabled 判断）
+    const ensurePrefetch = (mediaUrl: string, currentTime: number, horizonSeconds?: number) => {
+      if (!episodeKey) return;
+      getVideoPrefetcher().ensure({
+        m3u8Url: mediaUrl,
+        currentTime,
+        episodeKey,
+        horizonSeconds,
+        onProgress: (stats) => {
+          // 当前集预取完成且存在下一集：用独立预取器预热下一集前 7 分钟
+          if (stats.state === 'done' && nextUrl && nextEpisodeKey) {
+            getNextEpisodePrefetcher().ensure({
+              m3u8Url: nextUrl,
+              currentTime: 0,
+              episodeKey: nextEpisodeKey,
+              horizonSeconds: 420,
+            });
+          }
+        },
+      });
+    };
+
     const setupHls = (video: HTMLVideoElement, mediaUrl: string, allowProxyFallback: boolean) => {
       hlsRef.current?.destroy();
       const hls = new Hls(hlsConfig);
@@ -124,31 +147,51 @@ export function PlayerShell({
       hls.attachMedia(video);
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        recovery.markHealthy();
         video.play().catch(() => {});
       });
+      // 播放链路恢复（FRAG_LOADED / MANIFEST_PARSED）：静默窗外清零连续失败计数
+      hls.on(Hls.Events.FRAG_LOADED, () => recovery.markHealthy());
+
       hls.on(Hls.Events.ERROR, (_evt, data) => {
-        errorCount++;
-        if (data.fatal && !playbackStarted) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              if (
-                allowProxyFallback &&
-                !mediaUrl.startsWith('/api/proxy/') &&
-                (errorCount >= 2 || data.details === 'manifestLoadError')
-              ) {
-                showHint('直连失败，改用代理重试...');
-                setupHls(video, `/api/proxy/${encodeURIComponent(mediaUrl)}`, false);
-                return;
-              }
-              hls.startLoad();
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              hls.recoverMediaError();
-              break;
-            default:
-              if (errorCount > 3) {
-                setError('视频加载失败，可能是格式不兼容或源不可用，请尝试其他视频源');
-              }
+        if (!data.fatal) return;
+        const decision = recovery.onFatal(data.type, data.details);
+        switch (decision.action) {
+          case 'ignore':
+            break;
+          case 'retry': {
+            // 前两次重试保留直连；达到退避阈值或清单级错误时升级为代理形式
+            // （同源 cookie 鉴权，规避 CORS/防盗链/分片被拒）
+            if (
+              allowProxyFallback &&
+              !mediaUrl.startsWith('/api/proxy') &&
+              (decision.attempt >= 2 || data.details === 'manifestLoadError')
+            ) {
+              showHint('直连失败，改用代理重试...');
+              setupHls(video, `/api/proxy?url=${encodeURIComponent(mediaUrl)}`, false);
+              return;
+            }
+            showHint(`${decision.reason}（第 ${decision.attempt} 次）...`);
+            recovery.schedule(decision.delayMs, () => hls.startLoad());
+            break;
+          }
+          case 'recover-media': {
+            showHint(`${decision.reason}（第 ${decision.attempt} 次）...`);
+            if (decision.swapAudio) hls.swapAudioCodec?.();
+            hls.recoverMediaError();
+            break;
+          }
+          case 'switch-source': {
+            // 覆盖播放开始后的场景：起播失败走 setError 遮罩；
+            // 播放中失败走回调弹换源面板（父级未提供回调时同样 setError）
+            const message = `${describeHlsError(data.type, data.details)}：${decision.reason}`;
+            if (playbackStarted) {
+              showHint(message);
+              cbs.current.onRequestSwitchSource?.(decision.reason);
+            } else {
+              setError(`视频加载失败，${message}，请尝试其他视频源`);
+            }
+            break;
           }
         }
       });
@@ -219,9 +262,26 @@ export function PlayerShell({
         lastSave = now;
         cbs.current.onTimeUpdate?.(art.currentTime, art.duration);
       }
+      // 每 30s 续跑一次前向预取窗口（ensure 幂等，窗口未覆盖足够余量才会重建）
+      if (now - lastPrefetchEnsure > 30_000) {
+        lastPrefetchEnsure = now;
+        ensurePrefetch(url, art.currentTime);
+      }
+    });
+    art.on('video:seeked', () => {
+      ensurePrefetch(url, art.currentTime);
     });
     art.on('video:pause', () => {
       cbs.current.onPause?.(art.currentTime, art.duration);
+      // 暂停 = 预取黄金窗口：解除限速并无限铺满整集（用户主动行为，带宽占用可接受）
+      ensurePrefetch(url, art.currentTime, 0);
+    });
+    art.on('video:waiting', () => {
+      // 卡顿：预取临时让出带宽给播放
+      getVideoPrefetcher().setThrottled(true);
+    });
+    art.on('video:playing', () => {
+      getVideoPrefetcher().setThrottled(false);
     });
     art.on('video:ended', () => {
       ended = true;
@@ -321,6 +381,8 @@ export function PlayerShell({
       el?.removeEventListener('touchmove', onTouchMove);
       hlsRef.current?.destroy();
       hlsRef.current = null;
+      recovery.dispose();
+      getVideoPrefetcher().stop();
       art.destroy();
       artRef.current = null;
     };

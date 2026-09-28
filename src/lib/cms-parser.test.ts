@@ -60,6 +60,24 @@ describe('extractEpisodesFromPlayUrl', () => {
     expect(extractEpisodesFromPlayUrl(play)).toEqual(['https://cdn/a3.m3u8']);
   });
 
+  it('第一条线路为中转页时优先取 m3u8 线路（量子/非凡类源）', () => {
+    const play =
+      'HD中字$https://vip.lzcdn2.com/share/abc$$$HD中字$https://vip.lzcdn2.com/20220329/1012_e9be6a92/index.m3u8';
+    expect(extractEpisodesFromPlayUrl(play)).toEqual([
+      'https://vip.lzcdn2.com/20220329/1012_e9be6a92/index.m3u8',
+    ]);
+  });
+
+  it('第一条线路为空时取后续有效线路', () => {
+    const play = '第1集$$$第1集$https://cdn/b.m3u8';
+    expect(extractEpisodesFromPlayUrl(play)).toEqual(['https://cdn/b.m3u8']);
+  });
+
+  it('两条线路均无 m3u8 时回退第一条', () => {
+    const play = '第1集$https://cdn/a.mp4$$$第1集$https://cdn2/a.mp4';
+    expect(extractEpisodesFromPlayUrl(play)).toEqual(['https://cdn/a.mp4']);
+  });
+
   it('空输入返回空数组', () => {
     expect(extractEpisodesFromPlayUrl('')).toEqual([]);
   });

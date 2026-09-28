@@ -7,6 +7,7 @@ import { Drawer } from './drawer';
 import { ConfirmDialog } from './confirm-dialog';
 import { EmptyState, LoadingState } from './states';
 import { Icon } from './icon';
+import { SmartImage } from './smart-image';
 import {
   db,
   clearAllHistory,
@@ -15,7 +16,7 @@ import {
   MAX_HISTORY,
   type HistoryEntry,
 } from '@/lib/db';
-import { buildWatchUrl, buildImageUrl, cn, formatRelativeTime, formatTime } from '@/lib/utils';
+import { buildWatchUrl, cn, formatRelativeTime, formatTime } from '@/lib/utils';
 import { useToast } from './toast';
 import { resolveSource, useAppStore } from '@/lib/store';
 
@@ -143,7 +144,6 @@ function HistoryItem({ item }: { item: HistoryEntry }) {
   const { toast } = useToast();
   const [imgFailed, setImgFailed] = useState(false);
   const source = resolveSource({ customAPIs, envSources }, item.sourceKey);
-  const pic = buildImageUrl(item.pic, imageProxyMode, customImageProxy);
 
   const hasPercent =
     item.playbackPosition > 10 && item.duration > 0 && item.playbackPosition < item.duration * 0.95;
@@ -194,14 +194,14 @@ function HistoryItem({ item }: { item: HistoryEntry }) {
         className="block bg-card hover:bg-hover rounded-lg p-3 pr-10 transition-colors"
       >
         <div className="flex items-center gap-3">
-          {pic && !imgFailed ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={pic}
+          {item.pic && !imgFailed ? (
+            <SmartImage
+              url={item.pic}
+              mode={imageProxyMode}
+              customProxy={customImageProxy}
               alt=""
               className="w-10 h-14 object-cover rounded bg-chip"
-              loading="lazy"
-              onError={() => setImgFailed(true)}
+              onExhausted={() => setImgFailed(true)}
             />
           ) : (
             <div className="w-10 h-14 rounded bg-chip flex items-center justify-center shrink-0">

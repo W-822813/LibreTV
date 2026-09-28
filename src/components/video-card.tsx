@@ -2,9 +2,9 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import type { SearchResultItem } from '@/lib/types';
-import { buildImageUrl } from '@/lib/utils';
 import { useAppStore } from '@/lib/store';
 import { cn } from '@/lib/utils';
+import { SmartImage } from './smart-image';
 
 // —— 跨源同名聚合 ——
 
@@ -75,9 +75,7 @@ export function AggregatedCard({
   const customImageProxy = useAppStore((s) => s.customImageProxy);
   const [imgFailed, setImgFailed] = useState(false);
   const [expanded, setExpanded] = useState(false);
-  const primary = buildImageUrl(group.pic, imageProxyMode, customImageProxy);
-  useEffect(() => setImgFailed(false), [primary]);
-  const showImg = primary && !imgFailed;
+  const showImg = !!group.pic && !imgFailed;
 
   const multi = group.items.length > 1;
   const adult = useMemo(() => group.items.some((i) => i.isAdult), [group.items]);
@@ -105,13 +103,13 @@ export function AggregatedCard({
       >
         {showImg ? (
           <div className="relative flex-shrink-0 w-[105px] sm:w-[120px] aspect-[2/3] bg-chip">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={primary}
+            <SmartImage
+              url={group.pic}
+              mode={imageProxyMode}
+              customProxy={customImageProxy}
               alt={group.name}
               className="absolute inset-0 h-full w-full object-cover"
-              loading="lazy"
-              onError={() => setImgFailed(true)}
+              onExhausted={() => setImgFailed(true)}
             />
             <div className="absolute inset-0 bg-gradient-to-r from-black/30 to-transparent" />
             {multi && (
@@ -207,10 +205,7 @@ export function VideoCard({ item, onClick }: { item: SearchResultItem; onClick: 
   const imageProxyMode = useAppStore((s) => s.imageProxyMode);
   const customImageProxy = useAppStore((s) => s.customImageProxy);
   const [imgFailed, setImgFailed] = useState(false);
-  const primary = buildImageUrl(item.pic, imageProxyMode, customImageProxy);
-  // 加载方式变化时重置失败状态，允许新地址重试
-  useEffect(() => setImgFailed(false), [primary]);
-  const showImg = primary && !imgFailed;
+  const showImg = !!item.pic && !imgFailed;
 
   return (
     <div
@@ -229,13 +224,13 @@ export function VideoCard({ item, onClick }: { item: SearchResultItem; onClick: 
       <div className="flex h-full">
         {showImg ? (
           <div className="relative flex-shrink-0 w-[105px] sm:w-[120px] aspect-[2/3] bg-chip">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={primary}
+            <SmartImage
+              url={item.pic}
+              mode={imageProxyMode}
+              customProxy={customImageProxy}
               alt={item.name}
               className="h-full w-full object-cover"
-              loading="lazy"
-              onError={() => setImgFailed(true)}
+              onExhausted={() => setImgFailed(true)}
             />
             <div className="absolute inset-0 bg-gradient-to-r from-black/30 to-transparent" />
           </div>
@@ -272,8 +267,7 @@ export function DoubanCard({ item, onClick }: { item: { title: string; cover: st
   const imageProxyMode = useAppStore((s) => s.imageProxyMode);
   const customImageProxy = useAppStore((s) => s.customImageProxy);
   const [imgFailed, setImgFailed] = useState(false);
-  const primary = buildImageUrl(item.cover, imageProxyMode, customImageProxy);
-  useEffect(() => setImgFailed(false), [primary]);
+  useEffect(() => setImgFailed(false), [item.cover]);
 
   return (
     <div
@@ -290,14 +284,14 @@ export function DoubanCard({ item, onClick }: { item: { title: string; cover: st
       }}
     >
       <div className="relative aspect-[2/3] bg-chip">
-        {primary && !imgFailed ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={primary}
+        {item.cover && !imgFailed ? (
+          <SmartImage
+            url={item.cover}
+            mode={imageProxyMode}
+            customProxy={customImageProxy}
             alt={item.title}
             className="w-full h-full object-cover"
-            loading="lazy"
-            onError={() => setImgFailed(true)}
+            onExhausted={() => setImgFailed(true)}
           />
         ) : (
           <div className="w-full h-full flex items-center justify-center bg-chip">

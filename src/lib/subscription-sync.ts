@@ -127,4 +127,15 @@ export async function applyEnvPresets(status: AuthStatusResponse): Promise<void>
       useAppStore.setState({ recommendSource: status.defaultRecommendSource });
     }
   }
+  // 部署者通过 DEFAULT_IMAGE_MODE 指定的封面图加载方式默认值（未配置时不改动）。
+  // 与推荐数据源同一套语义：仅对未主动选择过的用户生效（仍为出厂默认 direct 且无
+  // 「已选择」标记），已有偏好的用户——包括 touched 标记上线前手动改过的——不被覆盖；
+  // custom 需要手填模板，无论有无标记都视为明确选择，不覆盖。
+  // 直写 setState 而非 updateSettings：自动预置不算用户主动选择，不打「已选择」标记。
+  if (status.defaultImageMode) {
+    const s = useAppStore.getState();
+    if (!s.imageProxyModeTouched && s.imageProxyMode === 'direct') {
+      useAppStore.setState({ imageProxyMode: status.defaultImageMode });
+    }
+  }
 }

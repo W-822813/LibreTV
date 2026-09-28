@@ -4,7 +4,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/client-api';
 import type { SearchResultItem, VideoDetail } from '@/lib/types';
-import { buildImageUrl, buildWatchUrl } from '@/lib/utils';
+import { buildWatchUrl } from '@/lib/utils';
+import { SmartImage } from './smart-image';
 import { useAppStore, resolveSource } from '@/lib/store';
 import { useToast } from './toast';
 import { cn } from '@/lib/utils';
@@ -30,12 +31,11 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
   const [posterFailed, setPosterFailed] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
-  const poster = buildImageUrl(item?.pic, store.imageProxyMode, store.customImageProxy);
 
   // 打开时把焦点移入弹窗、Tab 圈闭在弹窗内、关闭后归还焦点
   useFocusTrap(Boolean(item), panelRef);
 
-  useEffect(() => setPosterFailed(false), [poster]);
+  useEffect(() => setPosterFailed(false), [item?.pic, store.imageProxyMode, store.customImageProxy]);
 
   // 弹窗打开期间锁定背景滚动
   useEffect(() => {
@@ -161,13 +161,15 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
           {!loading && !error && detail && (
             <>
               <div className="flex flex-col sm:flex-row gap-4 mb-4">
-                {poster && !posterFailed && (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    src={poster}
+                {item?.pic && !posterFailed && (
+                  <SmartImage
+                    url={item.pic}
+                    mode={store.imageProxyMode}
+                    customProxy={store.customImageProxy}
                     alt={item.name}
                     className="w-24 sm:w-32 aspect-[2/3] object-cover rounded-lg bg-chip shrink-0 self-center sm:self-start"
-                    onError={() => setPosterFailed(true)}
+                    loading="eager"
+                    onExhausted={() => setPosterFailed(true)}
                   />
                 )}
                 <div className="min-w-0 space-y-3">

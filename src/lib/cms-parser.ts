@@ -46,17 +46,27 @@ export function parseSearchList(
   });
 }
 
-/** 从 vod_play_url 中提取分集地址：格式 源1$$$源2，集1$URL1#集2$URL2 */
+/**
+ * 从 vod_play_url 中提取分集地址：格式 源1$$$源2，集1$URL1#集2$URL2。
+ * 部分源（如量子 lziapi、非凡 ffzy）第一条线路是网页中转页（…/share/xxx，不可播），
+ * 真实 m3u8 在后面的线路里，因此优先取包含 m3u8 直链的线路；均无 m3u8 时回退第一条。
+ */
 export function extractEpisodesFromPlayUrl(playUrl: string): string[] {
   if (!playUrl) return [];
-  const firstSource = playUrl.split('$$$')[0] ?? '';
-  return firstSource
-    .split('#')
-    .map((ep) => {
-      const parts = ep.split('$');
-      return parts.length > 1 ? parts[1] : '';
-    })
-    .filter((url) => url.startsWith('http://') || url.startsWith('https://'));
+  const groups = playUrl
+    .split('$$$')
+    .map((group) =>
+      group
+        .split('#')
+        .map((ep) => {
+          const parts = ep.split('$');
+          return parts.length > 1 ? parts[1] : '';
+        })
+        .filter((url) => url.startsWith('http://') || url.startsWith('https://'))
+    )
+    .filter((eps) => eps.length > 0);
+  if (groups.length === 0) return [];
+  return groups.find((eps) => eps.some((url) => url.includes('.m3u8'))) ?? groups[0];
 }
 
 /** 从简介文本中兜底提取 m3u8 链接 */

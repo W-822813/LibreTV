@@ -17,6 +17,8 @@ const PlayerShell = dynamic(() => import('@/components/player-shell').then((m) =
 });
 import { EmptyState, LoadingState, Spinner } from '@/components/states';
 import { SwitchSourceModal } from '@/components/switch-source';
+import { useToast } from '@/components/toast';
+import { enqueueDownload } from '@/components/download-manager';
 import { Icon } from '@/components/icon';
 import { useAuth } from '@/components/auth';
 import { resolveSource, useAppStore } from '@/lib/store';
@@ -73,6 +75,7 @@ function WatchContent() {
 
   const episodes = useMemo(() => detailQuery.data?.episodes ?? [], [detailQuery.data]);
   const videoTitle = titleParam || detailQuery.data?.videoInfo?.title || '未知视频';
+  const { toast } = useToast();
 
   // 当前播放地址：优先取剧集列表中的当前集，其次直连 URL 参数
   const currentUrl = useMemo(() => {
@@ -206,6 +209,20 @@ function WatchContent() {
             </p>
           </div>
           <div className="ml-auto flex items-center gap-2">
+            <button
+              className="btn-ghost btn-sm"
+              onClick={() => {
+                if (!currentUrl) return;
+                enqueueDownload({
+                  url: currentUrl,
+                  title: `${videoTitle}${episodes.length > 0 ? ` 第${currentIndex + 1}集` : ''}`,
+                  format: 'MP4',
+                });
+                toast('已加入下载队列', 'success');
+              }}
+            >
+              下载本集
+            </button>
             <button className="btn-ghost btn-sm" onClick={() => setSwitchOpen(true)}>
               切换资源
             </button>
@@ -223,6 +240,9 @@ function WatchContent() {
                   title={videoTitle}
                   adFilter={store.adFilter}
                   autoplayNext={store.autoplayNext}
+                  episodeKey={`${sourceKey}:${vodId}:${currentIndex}`}
+                  nextUrl={currentIndex + 1 < episodes.length ? episodes[currentIndex + 1] : undefined}
+                  nextEpisodeKey={currentIndex + 1 < episodes.length ? `${sourceKey}:${vodId}:${currentIndex + 1}` : undefined}
                   getRestorePosition={getRestorePosition}
                   onTimeUpdate={handleProgress}
                   onPause={handleProgress}

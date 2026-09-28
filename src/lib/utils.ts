@@ -32,6 +32,8 @@ export function formatDisableTtl(ms: number): string {
 /**
  * 封面图加载地址：direct 直连 / proxy 内置代理 / custom 自定义模板（{url} 占位符或直接拼接）。
  * 默认 proxy（内置代理），规避豆瓣防盗链与部分采集站图床直连失败。
+ * 代理走查询串形式（/api/proxy?url=…）：路径里的 %2F 会被 EdgeOne 等网关
+ * 在路由匹配前解码成 /，查询串不受影响，全平台行为一致。
  */
 export function buildImageUrl(
   url: string | undefined,
@@ -39,13 +41,42 @@ export function buildImageUrl(
   customTemplate: string
 ): string | undefined {
   if (!url) return undefined;
-  if (mode === 'proxy') return `/api/proxy/${encodeURIComponent(url)}`;
+  if (mode === 'proxy') return `/api/proxy?url=${encodeURIComponent(url)}`;
   if (mode === 'custom' && customTemplate) {
     return customTemplate.includes('{url}')
       ? customTemplate.replace('{url}', encodeURIComponent(url))
       : customTemplate + encodeURIComponent(url);
   }
   return url;
+}
+
+/**
+ * 封面图降级候选链，各模式首选地址失败后由 SmartImage 按序回退（onError 逐级尝试）：
+ * - direct 模式：原站直连 → cmliussss 公共镜像（腾讯 / 阿里，仅豆瓣图）→ 内置代理。
+ *   doubanio 反爬对外域与空 Referer 分别返回 403 / 418，纯前端无法绕过；
+ *   公共镜像实测直连可用，置于自家代理之前以节省服务器流量。
+ * - proxy 模式：内置代理 → 公共镜像（仅豆瓣图）→ 原站直连。
+ *   代理是全站封面的公共依赖，不能单点——代理故障时自动落到直连/镜像。
+ * - custom 模式为单一地址：模板错误应显式暴露，不被静默回退掩盖。
+ */
+export function buildImageCandidates(
+  url: string | undefined,
+  mode: 'direct' | 'proxy' | 'custom',
+  customTemplate: string
+): string[] {
+  const built = buildImageUrl(url, mode, customTemplate);
+  if (!built || !url) return [];
+  const mirrors = url.includes('doubanio.com')
+    ? [
+        url.replace(/img\d+\.doubanio\.com/g, 'img.doubanio.cmliussss.net'),
+        url.replace(/img\d+\.doubanio\.com/g, 'img.doubanio.cmliussss.com'),
+      ]
+    : [];
+  if (mode === 'proxy') {
+    return [...new Set([built, ...mirrors, url])];
+  }
+  if (mode !== 'direct') return [built];
+  return [...new Set([built, ...mirrors, `/api/proxy?url=${encodeURIComponent(url)}`])];
 }
 
 export function validateSourceUrl(url: string): boolean {

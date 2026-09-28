@@ -33,6 +33,7 @@ const status = (over: Partial<AuthStatusResponse> = {}): AuthStatusResponse => (
   defaultLiveSources: [],
   defaultSubscriptions: [],
   defaultRecommendSource: null,
+  defaultImageMode: null,
   ...over,
 });
 
@@ -172,5 +173,53 @@ describe('applyEnvPresets · DEFAULT_RECOMMEND_SOURCE（issue #918）', () => {
     await applyEnvPresets(status({ defaultRecommendSource: 'douban' }));
     expect(useAppStore.getState().recommendSource).toBe('douban');
     expect(useAppStore.getState().recommendSourceTouched).toBe(false);
+  });
+});
+
+describe('applyEnvPresets · DEFAULT_IMAGE_MODE', () => {
+  it('未配置时不改动封面图加载方式', async () => {
+    useAppStore.setState({ imageProxyMode: 'direct', imageProxyModeTouched: false });
+    await applyEnvPresets(status());
+    expect(useAppStore.getState().imageProxyMode).toBe('direct');
+  });
+
+  it('对未主动选择过的用户应用部署者默认值，且不打「已选择」标记', async () => {
+    useAppStore.setState({ imageProxyMode: 'direct', imageProxyModeTouched: false });
+    await applyEnvPresets(status({ defaultImageMode: 'proxy' }));
+    expect(useAppStore.getState().imageProxyMode).toBe('proxy');
+    // 自动预置不算用户主动选择：部署者日后调整默认值时该用户应跟随
+    expect(useAppStore.getState().imageProxyModeTouched).toBe(false);
+  });
+
+  it('已主动选择过的用户（如 proxy）不被覆盖', async () => {
+    useAppStore.setState({ imageProxyMode: 'proxy', imageProxyModeTouched: true });
+    await applyEnvPresets(status({ defaultImageMode: 'proxy' }));
+    expect(useAppStore.getState().imageProxyMode).toBe('proxy');
+  });
+
+  it('显式选回 direct 的用户（带「已选择」标记）不被覆盖', async () => {
+    useAppStore.setState({ imageProxyMode: 'direct', imageProxyModeTouched: true });
+    await applyEnvPresets(status({ defaultImageMode: 'proxy' }));
+    expect(useAppStore.getState().imageProxyMode).toBe('direct');
+  });
+
+  it('存量用户：从未打过标记但偏好已不是出厂默认值的（老版本手动改过）不被覆盖', async () => {
+    useAppStore.setState({ imageProxyMode: 'proxy', imageProxyModeTouched: false });
+    await applyEnvPresets(status({ defaultImageMode: 'direct' }));
+    expect(useAppStore.getState().imageProxyMode).toBe('proxy');
+  });
+
+  it('custom 模式（需手填模板，视为明确选择）不被覆盖', async () => {
+    useAppStore.setState({ imageProxyMode: 'custom', imageProxyModeTouched: false });
+    await applyEnvPresets(status({ defaultImageMode: 'direct' }));
+    expect(useAppStore.getState().imageProxyMode).toBe('custom');
+  });
+
+  it('重复调用幂等：应用一次后再调用不改变结果', async () => {
+    useAppStore.setState({ imageProxyMode: 'direct', imageProxyModeTouched: false });
+    await applyEnvPresets(status({ defaultImageMode: 'proxy' }));
+    await applyEnvPresets(status({ defaultImageMode: 'proxy' }));
+    expect(useAppStore.getState().imageProxyMode).toBe('proxy');
+    expect(useAppStore.getState().imageProxyModeTouched).toBe(false);
   });
 });

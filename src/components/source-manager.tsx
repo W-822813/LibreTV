@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Drawer } from './drawer';
 import { ConfirmDialog } from './confirm-dialog';
 import { Icon, type IconName } from './icon';
@@ -16,6 +16,7 @@ import {
   useSourceTests,
   type TestState,
 } from './settings-shared';
+import { loadCacheSettings, saveCacheSettings, getCacheSummary, clearVideoCache, type CacheSummary } from '@/lib/video-cache';
 import { EmptyState, Spinner } from './states';
 import { useSourceProbe } from './use-source-probe';
 import { allLiveSources, isSourceDisabled, keyBelongsToSubscription, resolveSource, subKeyPrefix, useAppStore } from '@/lib/store';
@@ -562,8 +563,8 @@ function PlaybackPanel() {
       <SectionTitle title="播放与过滤" />
       <div className="space-y-3">
         <ToggleRow
-          label="广告过滤"
-          description="过滤 m3u8 中的广告分片"
+          label="片头广告剔除"
+          description="剔除播放列表片头插入的广告段（不影响 DISCONTINUITY 时间轴）"
           checked={store.adFilter}
           onChange={(v) => store.updateSettings({ adFilter: v })}
         />
@@ -574,28 +575,88 @@ function PlaybackPanel() {
           onChange={(v) => store.updateSettings({ autoplayNext: v })}
         />
       </div>
+      <VideoCachePanel />
     </section>
+  );
+}
+
+/** 片段缓存：开启/关闭 + 用量展示 + 清理（数据在浏览器本地，独立于配置导出） */
+function VideoCachePanel() {
+  const [enabled, setEnabled] = useState(() => loadCacheSettings().enabled);
+  const [summary, setSummary] = useState<CacheSummary>({ segments: 0, bytes: 0, episodes: 0 });
+  const [clearing, setClearing] = useState(false);
+
+  const refresh = useCallback(() => {
+    void getCacheSummary().then(setSummary);
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const formatBytes = (bytes: number): string => {
+    if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+    if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
+    return `${(bytes / 1024).toFixed(0)} KB`;
+  };
+
+  return (
+    <div className="space-y-3 pt-3 mt-3 border-t border-line">
+      <ToggleRow
+        label="片段本地缓存"
+        description="暂停或观看时把后续分片缓存到浏览器本地，二次播放与断网卡顿时直接命中（存储于本机，不计入配置导出）"
+        checked={enabled}
+        onChange={(v) => {
+          const next = saveCacheSettings({ enabled: v });
+          setEnabled(next.enabled);
+        }}
+      />
+      <div className="flex items-center justify-between text-xs text-faint">
+        <span>
+          已缓存 {summary.segments} 个分片 · {formatBytes(summary.bytes)} · {summary.episodes} 集
+        </span>
+        <button
+          type="button"
+          className="px-2 py-1 rounded bg-chip text-content hover:bg-hover transition-colors disabled:opacity-50"
+          disabled={clearing || summary.segments === 0}
+          onClick={async () => {
+            setClearing(true);
+            await clearVideoCache();
+            refresh();
+            setClearing(false);
+          }}
+        >
+          清理缓存
+        </button>
+      </div>
+    </div>
   );
 }
 
 function ImagePanel() {
   const store = useAppStore();
+  const mode = store.imageProxyMode;
+  const description: Record<'direct' | 'proxy' | 'custom', string> = {
+    direct: '原站直连；豆瓣封面自动换公共镜像，仍失败回退内置代理。最省服务器流量',
+    proxy: '封面优先经本站服务器转发并伪装来源，失败自动回退公共镜像/直连。最稳定，消耗服务器流量',
+    custom: '使用你填写的模板转发封面图',
+  };
   return (
     <section>
       <SectionTitle title="封面图加载" />
       <div className="space-y-2">
         <SelectRow
           label="加载方式"
-          value={store.imageProxyMode}
+          value={mode}
+          description={description[mode]}
           onChange={(v) => store.updateSettings({ imageProxyMode: v as 'direct' | 'proxy' | 'custom' })}
           options={[
-            { value: 'direct', label: '直连' },
-            { value: 'proxy', label: '内置代理（默认）' },
-            { value: 'custom', label: '自定义代理' },
+            { value: 'direct', label: '直连优先', hint: '最省服务器流量' },
+            { value: 'proxy', label: '内置代理', hint: '最稳定' },
+            { value: 'custom', label: '自定义', hint: '自建转发模板' },
           ]}
         />
-        {store.imageProxyMode === 'custom' && <CustomProxyInput />}
-        <p className="text-xs text-faint">豆瓣封面在某些网络下直连会被拒绝，可切换为内置代理。</p>
+        {mode === 'custom' && <CustomProxyInput />}
       </div>
     </section>
   );
@@ -653,9 +714,9 @@ function HomePanel() {
           value={store.recommendSource}
           onChange={(v) => store.updateSettings({ recommendSource: v as 'douban' | 'bangumi' | 'hot-list' })}
           options={[
-            { value: 'douban', label: '豆瓣（电影/剧集）' },
-            { value: 'bangumi', label: 'Bangumi 新番放送' },
-            { value: 'hot-list', label: '影视榜单（豆瓣周榜/百度热播）' },
+            { value: 'douban', label: '豆瓣', hint: '热门电影与剧集' },
+            { value: 'bangumi', label: 'Bangumi', hint: '每日新番放送（免 key）' },
+            { value: 'hot-list', label: '影视榜单', hint: '豆瓣周榜 / 百度热播' },
           ]}
         />
       </div>

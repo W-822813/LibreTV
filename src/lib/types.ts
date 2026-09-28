@@ -104,6 +104,8 @@ export interface AuthStatusResponse {
   defaultSubscriptions: { url: string; name?: string }[];
   /** 部署者通过 DEFAULT_RECOMMEND_SOURCE 环境变量指定的首页推荐数据源默认值（未配置时为 null） */
   defaultRecommendSource: 'douban' | 'bangumi' | 'hot-list' | null;
+  /** 部署者通过 DEFAULT_IMAGE_MODE 环境变量指定的封面图加载方式默认值（未配置时为 null） */
+  defaultImageMode: 'direct' | 'proxy' | null;
 }
 
 // —— 直播 / IPTV ——

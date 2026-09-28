@@ -21,7 +21,8 @@ import { LiveEpgPanel } from '@/components/live-epg-panel';
 import { Spinner } from '@/components/states';
 import { useAuth } from '@/components/auth';
 import { allLiveSources, useAppStore } from '@/lib/store';
-import { buildImageUrl, cn } from '@/lib/utils';
+import { cn } from '@/lib/utils';
+import { SmartImage } from '@/components/smart-image';
 
 /**
  * 直播页：左侧播放器 + 频道信息 + 节目单；右侧频道侧栏。
@@ -51,6 +52,7 @@ function LiveContent() {
   const [copied, setCopied] = useState(false);
   // 移动端频道抽屉开合
   const [listOpen, setListOpen] = useState(false);
+  const [logoFailed, setLogoFailed] = useState(false);
   /** 侧栏上报的筛选排序结果（键盘换台沿此列表顺序）；ref 存储，不触发重渲染 */
   const filteredRef = useRef<LiveChannelItem[]>([]);
   /** 当前频道镜像：selectChannel 内读取最近一次播放的频道，用于记录"上一个频道" */
@@ -112,6 +114,9 @@ function LiveContent() {
     } as LiveChannelItem;
   }, [channels, currentUrl, searchParams]);
 
+  useEffect(() => {
+    setLogoFailed(false);
+  }, [currentChannel?.url]);
   useEffect(() => {
     currentChannelRef.current = currentChannel;
   }, [currentChannel]);
@@ -209,7 +214,7 @@ function LiveContent() {
     );
   }
 
-  const logo = buildImageUrl(currentChannel?.logo, imageProxyMode, customImageProxy);
+  const logo = currentChannel?.logo;
   const isFavorite = currentChannel ? liveFavorites.includes(currentChannel.url) : false;
 
   return (
@@ -247,9 +252,15 @@ function LiveContent() {
             {currentChannel && (
               <div className="bg-surface-raised border border-line rounded-lg p-3 mt-3 flex items-center gap-3">
                 <div className="w-10 h-10 shrink-0 rounded bg-chip flex items-center justify-center overflow-hidden">
-                  {logo ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={logo} alt="" className="w-full h-full object-contain" />
+                  {logo && !logoFailed ? (
+                    <SmartImage
+                      url={logo}
+                      mode={imageProxyMode}
+                      customProxy={customImageProxy}
+                      alt=""
+                      className="w-full h-full object-contain"
+                      onExhausted={() => setLogoFailed(true)}
+                    />
                   ) : (
                     <span className="text-xs text-faint">{currentChannel.name.slice(0, 1)}</span>
                   )}

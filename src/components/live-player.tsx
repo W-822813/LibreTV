@@ -11,11 +11,14 @@ import { Spinner } from './states';
  *   mp4/webm 等原生容器 → <video> 直接播放；
  * - 无扩展名的地址（如 /channel/xxx?token=...）默认按 HLS 处理，
  *   HLS 直连与代理均失败后**回退原生播放**一次（覆盖"内容是 MP4 却无 .m3u8 后缀"的源）；
- * - 每级直连失败自动切换到 /api/live/stream/ 代理通道重试一次；
+ * - 每级直连失败自动切换到 /api/live/stream 代理通道重试一次；
  * - 直播态 UI：无进度条、无倍速、无截图、无连播。
  */
 
-const STREAM_PROXY_PREFIX = '/api/live/stream/';
+/** 代理地址前缀（新旧形式 /api/live/stream/… 与 /api/live/stream?url=… 的共同前缀，用于防二次代理） */
+const STREAM_PROXY_PREFIX = '/api/live/stream';
+/** 代理地址（查询串形式：路径里的 %2F 会被 EdgeOne 等网关归一化，查询串不受影响） */
+const STREAM_PROXY_BASE = '/api/live/stream?url=';
 
 export function isFlvUrl(url: string): boolean {
   return /\.flv(\?|$)/i.test(url);
@@ -33,7 +36,7 @@ function engineOf(url: string): Engine {
 }
 
 function proxyUrl(url: string): string {
-  return STREAM_PROXY_PREFIX + encodeURIComponent(url);
+  return STREAM_PROXY_BASE + encodeURIComponent(url);
 }
 
 interface LivePlayerProps {
