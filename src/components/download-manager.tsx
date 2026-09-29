@@ -171,6 +171,7 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
         await db.downloads.put(entry);
         refresh();
         scheduleNext();
+        toast(`《${detail.title}》已加入下载队列`, 'success');
       })();
     };
 
@@ -220,7 +221,13 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
     await clearDownloadChunks(entry.id);
     await db.downloads.delete(entry.id);
     refresh();
-    toast(`《${entry.title}》已取消下载`, 'info');
+    // 终态（已完成/失败）删的是记录而非终止任务；文件已保存在用户选择的位置，不受影响
+    toast(
+      entry.status === 'completed' || entry.status === 'error'
+        ? `《${entry.title}》已删除下载记录`
+        : `《${entry.title}》已取消下载`,
+      'info'
+    );
   };
 
   const statusLabel: Record<DownloadTaskEntry['status'], string> = {
@@ -274,7 +281,7 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
                 )}
                 <button
                   type="button"
-                  aria-label="取消并删除任务"
+                  aria-label="删除下载任务"
                   className="p-1.5 rounded bg-chip hover:bg-hover text-content transition-colors"
                   onClick={() => void onCancel(t)}
                 >

@@ -17,7 +17,6 @@ const PlayerShell = dynamic(() => import('@/components/player-shell').then((m) =
 });
 import { EmptyState, LoadingState, Spinner } from '@/components/states';
 import { SwitchSourceModal } from '@/components/switch-source';
-import { useToast } from '@/components/toast';
 import { enqueueDownload } from '@/components/download-manager';
 import { Icon } from '@/components/icon';
 import { useAuth } from '@/components/auth';
@@ -75,7 +74,6 @@ function WatchContent() {
 
   const episodes = useMemo(() => detailQuery.data?.episodes ?? [], [detailQuery.data]);
   const videoTitle = titleParam || detailQuery.data?.videoInfo?.title || '未知视频';
-  const { toast } = useToast();
 
   // 当前播放地址：优先取剧集列表中的当前集，其次直连 URL 参数
   const currentUrl = useMemo(() => {
@@ -201,6 +199,7 @@ function WatchContent() {
       <header className="sticky top-0 z-40 bg-surface/90 backdrop-blur border-b border-line">
         <div className="max-w-7xl mx-auto px-4 h-14 flex items-center gap-3">
           <BackButton />
+          <HomeButton />
           <div className="min-w-0">
             <h1 className="text-sm font-medium text-content truncate">{videoTitle}</h1>
             <p className="text-xs text-faint">
@@ -215,10 +214,12 @@ function WatchContent() {
                 if (!currentUrl) return;
                 enqueueDownload({
                   url: currentUrl,
-                  title: `${videoTitle}${episodes.length > 0 ? ` 第${currentIndex + 1}集` : ''}`,
+                  // 多集才带集数后缀；单集影片（含电影）文件名就是纯标题
+                  title: `${videoTitle}${episodes.length > 1 ? ` 第${currentIndex + 1}集` : ''}`,
                   format: 'MP4',
                 });
-                toast('已加入下载队列', 'success');
+                // 「已加入下载队列」由 DownloadManager 在真正入队后提示：
+                // 这里先提示的话，用户随后取消保存位置会出现「已加入→已取消」的矛盾
               }}
             >
               下载本集
@@ -383,5 +384,19 @@ function BackButton() {
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
       </svg>
     </button>
+  );
+}
+
+/** 首页按钮：直达首页，避免从外链进入时逐级 back */
+function HomeButton() {
+  return (
+    <Link
+      href="/"
+      className="p-2 rounded-md text-muted hover:text-content hover:bg-hover transition-colors"
+      aria-label="回首页"
+      title="回首页"
+    >
+      <Icon name="home" className="w-5 h-5" />
+    </Link>
   );
 }

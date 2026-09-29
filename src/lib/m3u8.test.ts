@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { parseM3u8Playlist } from './m3u8-parse';
-import { isProxiedUri, rewriteM3u8, stripLeadAdGroup } from './m3u8';
+import { isProxiedUri, rewriteM3u8, stripAdGroups, stripLeadAdGroup } from './m3u8';
 
 const BASE = 'https://cdn.example.com/live/index.m3u8';
 
@@ -59,15 +59,16 @@ describe('isProxiedUri', () => {
   });
 });
 
+/** 按 dytt 实测结构造播放列表：片头广告段（首个 DISCONTINUITY 段）+ 若干正片段 */
+function dyttLike(adCount: number, adDur = 4): string {
+  const lines = ['#EXTM3U', '#EXT-X-TARGETDURATION:8', '#EXT-X-DISCONTINUITY'];
+  for (let i = 0; i < adCount; i++) lines.push(`#EXTINF:${adDur},`, `ad${i}.ts`);
+  lines.push('#EXT-X-DISCONTINUITY', '#EXTINF:4,', 'movie0.ts');
+  lines.push('#EXT-X-DISCONTINUITY', '#EXTINF:4,', 'movie1.ts', '#EXT-X-ENDLIST');
+  return lines.join('\n');
+}
+
 describe('stripLeadAdGroup', () => {
-  /** 按 dytt 实测结构造播放列表：片头广告段（首个 DISCONTINUITY 段）+ 若干正片段 */
-  function dyttLike(adCount: number, adDur = 4): string {
-    const lines = ['#EXTM3U', '#EXT-X-TARGETDURATION:8', '#EXT-X-DISCONTINUITY'];
-    for (let i = 0; i < adCount; i++) lines.push(`#EXTINF:${adDur},`, `ad${i}.ts`);
-    lines.push('#EXT-X-DISCONTINUITY', '#EXTINF:4,', 'movie0.ts');
-    lines.push('#EXT-X-DISCONTINUITY', '#EXTINF:4,', 'movie1.ts', '#EXT-X-ENDLIST');
-    return lines.join('\n');
-  }
 
   it('dytt 结构：整段剔除片头广告分片，正片与后续 DISCONTINUITY 保留', () => {
     const out = stripLeadAdGroup(dyttLike(3));
@@ -108,6 +109,162 @@ describe('stripLeadAdGroup', () => {
 
   it('空内容返回空串', () => {
     expect(stripLeadAdGroup('')).toBe('');
+  });
+
+  it('周期性 DISCONTINUITY 封装（每 N 片一个标记）：不误杀片头正常分组', () => {
+    // 模拟 rycjapi 类源：多分组、每组 5 片、相邻 DISCONTINUITY 间隙均匀（非广告）
+    const lines = ['#EXTM3U', '#EXT-X-PLAYLIST-TYPE:VOD', '#EXT-X-VERSION:3'];
+    const groups = 12;
+    for (let g = 0; g < groups; g++) {
+      lines.push('#EXT-X-DISCONTINUITY');
+      for (let s = 0; s < 5; s++) lines.push('#EXTINF:6,', `g${g}_s${s}.ts`);
+    }
+    lines.push('#EXT-X-ENDLIST');
+    const input = lines.join('\n');
+    const out = stripLeadAdGroup(input);
+    // 片头第一组（g0_s0.ts）必须保留，整体原样返回
+    expect(out).toBe(input);
+    expect(out).toContain('g0_s0.ts');
+  });
+
+  it('dytt 多分组封装（间隙不均但片头组与其余组同构）：不误杀片头', () => {
+    // 按 dytt 第1249集实测结构：64 组，多为 5 片，偶有 10/15/20 片长组
+    const sizes = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 10, 5, 4, 3, 2, 5, 5, 5, 5, 10, 5, 5, 5, 5, 5,
+      15, 5, 15, 5, 5, 5, 5, 5, 10, 5, 5, 5, 5, 5, 5, 5, 5, 5, 20, 5, 15, 5, 5, 5, 5, 5, 5, 5, 5,
+      5, 5, 10, 5, 5, 5, 10, 2, 2];
+    const lines = ['#EXTM3U', '#EXT-X-TARGETDURATION:8'];
+    sizes.forEach((n, g) => {
+      lines.push('#EXT-X-DISCONTINUITY');
+      for (let s = 0; s < n; s++) lines.push('#EXTINF:4.3,', `g${g}_s${s}.ts`);
+    });
+    lines.push('#EXT-X-ENDLIST');
+    const input = lines.join('\n');
+    const out = stripLeadAdGroup(input);
+    expect(out).toBe(input);
+    expect(out).toContain('g0_s0.ts');
+  });
+
+  it('多分组但片头组明显异于其余组（疑似真插入段）：照常剔除', () => {
+    // 12 组其余均为 5 片，片头组 12 片（54s）——大小显著偏离，视为片头插入段
+    const lines = ['#EXTM3U', '#EXT-X-TARGETDURATION:8', '#EXT-X-DISCONTINUITY'];
+    for (let s = 0; s < 12; s++) lines.push('#EXTINF:4.5,', `ad${s}.ts`);
+    for (let g = 0; g < 12; g++) {
+      lines.push('#EXT-X-DISCONTINUITY');
+      for (let s = 0; s < 5; s++) lines.push('#EXTINF:4.5,', `g${g}_s${s}.ts`);
+    }
+    lines.push('#EXT-X-ENDLIST');
+    const out = stripLeadAdGroup(lines.join('\n'));
+    expect(out).not.toContain('ad0.ts');
+    expect(out).toContain('g0_s0.ts');
+  });
+});
+
+describe('stripAdGroups', () => {
+  /** 按暴风源实测结构造播放列表：正片(顺序 1s 分片) + adjump 中插广告段 + 正片 */
+  function konanLike(): string {
+    const lines = ['#EXTM3U', '#EXT-X-TARGETDURATION:3'];
+    for (let i = 0; i < 312; i++) lines.push('#EXTINF:1,', `${String(i).padStart(7, '0')}.ts`);
+    lines.push('#EXT-X-DISCONTINUITY');
+    for (let i = 0; i < 3; i++) lines.push('#EXTINF:3,', `/video/adjump/time/1787320001790000000${i}.ts`);
+    lines.push('#EXT-X-DISCONTINUITY', '#EXTINF:1,', '0000312.ts', '#EXT-X-ENDLIST');
+    return lines.join('\n');
+  }
+
+  it('柯南实测结构：剔除 adjump 中插段，正片完整且只保留一个分段边界', () => {
+    const out = stripAdGroups(konanLike());
+    expect(out).not.toContain('adjump');
+    expect(out).toContain('0000311.ts');
+    expect(out).toContain('0000312.ts');
+    // 段前的 DISCONTINUITY 随段删除、段后的保留为正片分段边界 → 不出现双标记
+    expect(out.match(/#EXT-X-DISCONTINUITY/g)).toHaveLength(1);
+  });
+
+  it('段内混入正片分片时整段放过（全部分片命中特征才剔除）', () => {
+    const lines = [
+      '#EXTM3U',
+      '#EXTINF:1,',
+      'a.ts',
+      '#EXT-X-DISCONTINUITY',
+      '#EXTINF:3,',
+      '/video/adjump/time/x0.ts',
+      '#EXTINF:1,',
+      'real.ts',
+      '#EXT-X-DISCONTINUITY',
+      '#EXTINF:1,',
+      'b.ts',
+    ].join('\n');
+    expect(stripAdGroups(lines)).toBe(lines);
+  });
+
+  it('组合：URL 无特征的片头插入段仍由片头启发式兜底剔除', () => {
+    const out = stripAdGroups(dyttLike(3));
+    expect(out).not.toContain('ad0.ts');
+    expect(out).toContain('movie0.ts');
+  });
+});
+
+describe('stripAdGroups · 长片间超短中插（phimgood 结构）', () => {
+  /** 生成一组总时长 dur 的分片行 */
+  function group(dur: number, name: string, parts = 4): string[] {
+    const lines: string[] = [];
+    const each = dur / parts;
+    for (let i = 0; i < parts; i++) lines.push(`#EXTINF:${each.toFixed(3)},`, `${name}${i}.ts`);
+    return lines;
+  }
+
+  /** 长正片段之间夹短广告段（按 phimgood 实测比例构造） */
+  function phimgoodLike(): string {
+    return [
+      '#EXTM3U',
+      '#EXT-X-TARGETDURATION:8',
+      '#EXT-X-DISCONTINUITY',
+      ...group(298, 'a'),
+      '#EXT-X-DISCONTINUITY',
+      ...group(19, 'ad1', 3),
+      '#EXT-X-DISCONTINUITY',
+      ...group(200, 'b'),
+      '#EXT-X-DISCONTINUITY',
+      ...group(16, 'ad2', 3),
+      '#EXT-X-DISCONTINUITY',
+      ...group(150, 'c'),
+      '#EXT-X-ENDLIST',
+    ].join('\n');
+  }
+
+  it('两长夹一短：超短中插段剔除，长正片段与分段边界保留', () => {
+    const out = stripAdGroups(phimgoodLike());
+    expect(out).not.toContain('ad10.ts');
+    expect(out).not.toContain('ad20.ts');
+    expect(out).toContain('a0.ts');
+    expect(out).toContain('b0.ts');
+    expect(out).toContain('c0.ts');
+    // 4 个边界 DISCONTINUITY 删掉 2 个（各随广告段删除），剩 2 个
+    expect(out.match(/#EXT-X-DISCONTINUITY/g)).toHaveLength(2);
+  });
+
+  it('dytt 式全短段结构不触发（邻段不满足长段条件）', () => {
+    // 首组分片直接开始（无片头 DISCONTINUITY），避开片头启发式，纯测中插规则
+    const short = [
+      '#EXTM3U',
+      ...group(40, 'a'),
+      '#EXT-X-DISCONTINUITY',
+      ...group(24, 'mid'),
+      '#EXT-X-DISCONTINUITY',
+      ...group(24, 'b'),
+      '#EXT-X-ENDLIST',
+    ].join('\n');
+    expect(stripAdGroups(short)).toBe(short);
+  });
+
+  it('末组短段（无后邻）保守放过', () => {
+    const lines = [
+      '#EXTM3U',
+      ...group(300, 'a'),
+      '#EXT-X-DISCONTINUITY',
+      ...group(20, 'tail'),
+      '#EXT-X-ENDLIST',
+    ].join('\n');
+    expect(stripAdGroups(lines)).toBe(lines);
   });
 });
 

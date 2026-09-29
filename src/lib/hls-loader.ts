@@ -1,5 +1,5 @@
 import type HlsType from 'hls.js';
-import { stripLeadAdGroup } from './m3u8';
+import { stripAdGroups } from './m3u8';
 import { buildSegmentCacheKey, readCachedSegment, touchMeta } from './video-cache';
 
 /**
@@ -52,7 +52,7 @@ export function createHlsLoader(
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             callbacks.onSuccess = function (response: any, stats: any, ctx: any, networkDetails: any) {
               if (response.data && typeof response.data === 'string') {
-                response.data = stripLeadAdGroup(response.data);
+                response.data = stripAdGroups(response.data);
               }
               onSuccess(response, stats, ctx, networkDetails);
             };

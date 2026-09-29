@@ -1,4 +1,4 @@
-import { makeAbsolute, stripLeadAdGroup } from './m3u8';
+import { makeAbsolute, stripAdGroups } from './m3u8';
 
 /**
  * m3u8 播放列表解析（预取器与离线下载共用）。
@@ -96,7 +96,7 @@ function parseAesConf(line: string): AesConf | undefined {
 }
 
 export interface ParseOptions {
-  /** 剔除片头插入的广告段（dytt 等采集站把固定广告混为首个 DISCONTINUITY 段）；缺省 true */
+  /** 剔除广告段（URL 特征的中插段 + 片头无特征插入段）；缺省 true */
   stripLeadAd?: boolean;
 }
 
@@ -111,7 +111,7 @@ export async function parseM3u8Playlist(
   const res = await fetch(url, { headers: { Accept: '*/*' } });
   if (!res.ok) throw new Error(`m3u8 拉取失败：HTTP ${res.status}`);
   // 剔除片头广告段要在统计时长/分片之前做，下载产物才不会带上广告
-  const text = opts?.stripLeadAd === false ? await res.text() : stripLeadAdGroup(await res.text());
+  const text = opts?.stripLeadAd === false ? await res.text() : stripAdGroups(await res.text());
 
   // —— master：收集变体，选档后递归 ——
   if (text.includes('#EXT-X-STREAM-INF')) {
