@@ -85,6 +85,8 @@ export function PlayerShell({
   const videoErrorRetryUsedRef = useRef(false);
   // 进度恢复每集只执行一次（MANIFEST_PARSED 可能因代理回退再次触发）
   const restoredRef = useRef(false);
+  // timeupdate 续跑预取的游标：必须按集清零，否则会沿用上一集的时间戳推迟首次续跑
+  const lastPrefetchEnsureRef = useRef(0);
   // setupHls 可能改走代理形式，video:error 重试要用最近一次的地址
   const currentMediaUrlRef = useRef(url);
   // 本集的恢复策略实例：跨直连/代理两级重建共享计数
@@ -162,6 +164,10 @@ export function PlayerShell({
 
     hls.on(Hls.Events.MANIFEST_PARSED, async () => {
       recoveryRef.current?.markHealthy();
+      // 预取锚点：恢复进度时直接取恢复目标。赋值后 video.currentTime 未必立刻反映
+      // （Safari 系），而 ensure 是以「锚点未变」为前提复用 parsing 中的运行的——
+      // 这里读到旧值会把窗口建在片头，且白等一次纠错重建。
+      let prefetchAnchor = video.currentTime;
       // 进度恢复（每集一次）：优先 URL position，其次 IndexedDB 记录
       if (!restoredRef.current) {
         restoredRef.current = true;
@@ -170,10 +176,13 @@ export function PlayerShell({
           const duration = artRef.current?.duration || 0;
           if (saved > 10 && duration > 0 && saved < duration - 2) {
             if (artRef.current) artRef.current.currentTime = saved;
+            prefetchAnchor = saved;
             showHint(`已从 ${formatTime(saved)} 继续播放`);
           }
         } catch { /* 忽略恢复失败 */ }
       }
+      // 新集立即预取（否则要等 timeupdate 的 30s 节流，起播初期无缓存）
+      ensurePrefetch(mediaUrl, prefetchAnchor);
       video.play().catch(() => {});
     });
     // 播放链路恢复（FRAG_LOADED / MANIFEST_PARSED）：静默窗外清零连续失败计数
@@ -236,6 +245,7 @@ export function PlayerShell({
     playbackStartedRef.current = false;
     videoErrorRetryUsedRef.current = false;
     restoredRef.current = false;
+    lastPrefetchEnsureRef.current = 0;
     recoveryRef.current = new PlaybackRecovery();
     // 换集时清掉上一集的预取窗口，避免带宽被旧集占用
     getVideoPrefetcher().stop();
@@ -260,7 +270,6 @@ export function PlayerShell({
     endedRef.current = false;
 
     let lastSave = 0;
-    let lastPrefetchEnsure = 0;
 
     const art = new Artplayer({
       container: containerRef.current,
@@ -326,18 +335,22 @@ export function PlayerShell({
         propsRef.current.onTimeUpdate?.(art.currentTime, art.duration);
       }
       // 每 30s 续跑一次前向预取窗口（ensure 幂等，窗口未覆盖足够余量才会重建）
-      if (now - lastPrefetchEnsure > 30_000) {
-        lastPrefetchEnsure = now;
-        ensurePrefetch(propsRef.current.url, art.currentTime);
+      if (now - lastPrefetchEnsureRef.current > 30_000) {
+        lastPrefetchEnsureRef.current = now;
+        // 用 currentMediaUrlRef（代理回退后的实际地址）：否则预取的 key 与
+        // loader 读取的 key 不一致，缓存永不命中且直连 fetch 白耗流量
+        ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
       }
     });
     art.on('video:seeked', () => {
-      ensurePrefetch(propsRef.current.url, art.currentTime);
+      ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
     });
     art.on('video:pause', () => {
       propsRef.current.onPause?.(art.currentTime, art.duration);
       // 暂停 = 预取黄金窗口：解除限速并无限铺满整集（用户主动行为，带宽占用可接受）
-      ensurePrefetch(propsRef.current.url, art.currentTime, 0);
+      // waiting 触发的限速在此解除，否则黄金窗口会被 500ms 轮询冻结
+      getVideoPrefetcher().setThrottled(false);
+      ensurePrefetch(currentMediaUrlRef.current, art.currentTime, 0);
     });
     art.on('video:waiting', () => {
       // 卡顿：预取临时让出带宽给播放
@@ -391,13 +404,17 @@ export function PlayerShell({
 
     const onTouchStart = (e: TouchEvent) => {
       if (art.video?.paused) return;
+      // 已有触控在处理时忽略新手指：否则第二指会把 originalRate 捕获成 3.0，
+      // 松手后倍速永久卡在 3x；旧定时器句柄也会被覆盖成无法清除的幽灵触发
+      if (isLongPress || longPressTimer) return;
+      // 控制栏 / 设置面板上的长按不触发倍速（按住进度条拖动、长按倍速菜单项会误触）
+      if ((e.target as HTMLElement).closest?.('.art-controls, .art-settings')) return;
       originalRate = art.video.playbackRate;
       longPressTimer = setTimeout(() => {
         if (art.video?.paused) return;
         art.video.playbackRate = 3.0;
         isLongPress = true;
         showHint('3 倍速');
-        e.preventDefault();
       }, 500);
     };
     const onTouchEnd = () => {
@@ -411,10 +428,14 @@ export function PlayerShell({
     const onTouchMove = (e: TouchEvent) => {
       if (isLongPress) e.preventDefault();
     };
+    // ArtPlayer 的 contextmenu 组件只在桌面端初始化（移动端构造函数里跳过 init），
+    // 长按倍速因而会连带呼出系统原生菜单/气泡。播放器表面没有可用的原生菜单，统一抑制
+    const onContextMenu = (e: Event) => e.preventDefault();
     el?.addEventListener('touchstart', onTouchStart, { passive: false });
     el?.addEventListener('touchend', onTouchEnd);
     el?.addEventListener('touchcancel', onTouchEnd);
     el?.addEventListener('touchmove', onTouchMove, { passive: false });
+    el?.addEventListener('contextmenu', onContextMenu);
 
     // 卸载与页面隐藏时保存进度
     const saveOnHide = () => {
@@ -439,6 +460,7 @@ export function PlayerShell({
       el?.removeEventListener('touchend', onTouchEnd);
       el?.removeEventListener('touchcancel', onTouchEnd);
       el?.removeEventListener('touchmove', onTouchMove);
+      el?.removeEventListener('contextmenu', onContextMenu);
       hlsRef.current?.destroy();
       hlsRef.current = null;
       recoveryRef.current?.dispose();
@@ -462,13 +484,16 @@ export function PlayerShell({
   const firstAdFilterRef = useRef(true);
   useEffect(() => {
     if (firstAdFilterRef.current) { firstAdFilterRef.current = false; return; }
-    if (artRef.current && hlsRef.current) loadEpisode(propsRef.current.url);
+    if (artRef.current && hlsRef.current) {
+      // 用当前实际媒体地址：代理回退生效时切广告过滤不应跳回直连形式
+      loadEpisode(currentMediaUrlRef.current || propsRef.current.url);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adFilter]);
 
   return (
     <div className="relative w-full h-full">
-      <div ref={containerRef} className="w-full h-full" />
+      <div ref={containerRef} className="w-full h-full" style={{ WebkitTouchCallout: 'none' }} />
       {showPoster && !error && (
         <div
           className="absolute inset-0 bg-black pointer-events-none"

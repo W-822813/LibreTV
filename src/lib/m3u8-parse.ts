@@ -1,4 +1,4 @@
-import { makeAbsolute, stripAdGroups } from './m3u8';
+import { makeAbsolute, stripAdGroups, documentBaseURI } from './m3u8';
 
 /**
  * m3u8 播放列表解析（预取器与离线下载共用）。
@@ -6,6 +6,8 @@ import { makeAbsolute, stripAdGroups } from './m3u8';
  * 与 hls.js loader 侧的一致性是本地缓存命中的前提：
  * 两侧都通过 `new URL()` 绝对化地址（见 video-cache.buildSegmentCacheKey），
  * 因此这里对分片地址也必须用同一构造器抹平默认端口 / 百分号编码差异。
+ * 但仅有同一构造器不够——基址本身可能就是根相对的代理形式，
+ * `new URL(相对分片, 相对基址)` 会抛错并原样返回，所以入参要先锚到文档基址。
  */
 
 export interface ParsedSegment {
@@ -108,7 +110,11 @@ export async function parseM3u8Playlist(
   opts?: ParseOptions
 ): Promise<ParsedPlaylist> {
   if (depth > MAX_DEPTH) throw new Error(`m3u8 嵌套超过 ${MAX_DEPTH} 层`);
-  const res = await fetch(url, { headers: { Accept: '*/*' } });
+  // 入参本身可能是本站根相对地址（代理形态），先锚成绝对地址再作为解析基址：
+  // 否则 new URL(相对分片, 相对基址) 抛错，segments[].url 就停留在相对形式，
+  // 与 hls.js 按绝对清单地址解析出的同一个分片不再是同一个缓存 key
+  const base = makeAbsolute(url, documentBaseURI());
+  const res = await fetch(base, { headers: { Accept: '*/*' } });
   if (!res.ok) throw new Error(`m3u8 拉取失败：HTTP ${res.status}`);
   // 剔除片头广告段要在统计时长/分片之前做，下载产物才不会带上广告
   const text = opts?.stripLeadAd === false ? await res.text() : stripAdGroups(await res.text());
@@ -130,7 +136,7 @@ export async function parseM3u8Playlist(
       }
       if (!line || line.startsWith('#')) continue;
       if (pending) {
-        const abs = makeAbsolute(line, url);
+        const abs = makeAbsolute(line, base);
         variants.push({
           url: abs,
           bandwidth: pending.bandwidth,
@@ -156,7 +162,7 @@ export async function parseM3u8Playlist(
     if (line.startsWith('#EXT-X-KEY')) {
       // 取最后一次出现的 KEY（逐段换 key 的源不在支持范围）
       const conf = parseAesConf(line);
-      if (conf) aesConf = { ...conf, uri: makeAbsolute(conf.uri, url) };
+      if (conf) aesConf = { ...conf, uri: makeAbsolute(conf.uri, base) };
       continue;
     }
     if (line.startsWith('#EXT-X-BYTERANGE')) {
@@ -168,7 +174,7 @@ export async function parseM3u8Playlist(
       continue;
     }
     if (!line || line.startsWith('#')) continue;
-    segments.push({ url: makeAbsolute(line, url), duration: pendingDuration });
+    segments.push({ url: makeAbsolute(line, base), duration: pendingDuration });
     pendingDuration = 0;
   }
   if (!segments.length) throw new Error('m3u8 未解析到分片');
