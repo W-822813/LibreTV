@@ -64,6 +64,40 @@ export interface SourceSearchOutcome {
   ms?: number;
 }
 
+// —— 画质（按「源 + 影片」记录） ——
+
+/**
+ * 画质记录条目。
+ * `height` 为视频高度（像素），undefined 表示探测过但测不出（单码率 m3u8 / 直链）。
+ * `from` 区分来源：play 是播放器实测的真实分辨率（权威），probe 是解析 m3u8 推断值。
+ */
+export interface QualityEntry {
+  height?: number;
+  from: 'play' | 'probe';
+  /**
+   * 探测失败原因（如 `HTTP 403`、`请求超时`）。
+   * 有值 = 这次压根没探到；无值而 height 也缺失 = 探到了但源站没写画质信息。
+   * 两者在 UI 上都显示「未知」，靠这个字段区分出「源站不给」和「我们没够着」。
+   */
+  error?: string;
+  /** 记录时间（epoch ms），用于 LRU 淘汰与失败重试 */
+  timestamp: number;
+}
+
+/** 画质探测请求条目：源配置 + 影片 ID */
+export interface QualityProbeItem {
+  source: SourceConfig;
+  id: string;
+}
+
+/** 画质探测结果；height 缺失代表「测不出」而非失败失败（error 有值时才是失败） */
+export interface QualityProbeResult {
+  sourceKey: string;
+  vodId: string;
+  height?: number;
+  error?: string;
+}
+
 // —— API 响应结构 ——
 
 export interface SearchResponse {

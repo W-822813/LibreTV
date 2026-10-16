@@ -1,6 +1,6 @@
 'use client';
 
-import type { SearchResponse, SearchStreamEvent, SourceSearchOutcome, VideoDetail, DoubanResponse, BangumiCalendarResponse, AuthStatusResponse, SourceConfig, SearchResultItem, LivePlaylistResponse, LiveEpgResponse, SourceListPayload } from './types';
+import type { SearchResponse, SearchStreamEvent, SourceSearchOutcome, VideoDetail, DoubanResponse, BangumiCalendarResponse, AuthStatusResponse, SourceConfig, SearchResultItem, LivePlaylistResponse, LiveEpgResponse, SourceListPayload, QualityProbeItem, QualityProbeResult } from './types';
 
 /**
  * 客户端 API 封装。401 时触发全局事件打开登录框，
@@ -144,6 +144,27 @@ export const api = {
   detail: (id: string, source: SourceConfig, signal?: AbortSignal) => {
     const sp = new URLSearchParams({ id, source: JSON.stringify(source) });
     return request<VideoDetail>(`/api/detail?${sp.toString()}`, { signal });
+  },
+
+  /**
+   * 批量画质探测（NDJSON 流式）：展开来源面板时逐条回调，先到的源先显示画质。
+   * 结果里的 height 缺失代表「测不出」（单码率 m3u8 / 直链 / 防盗链），不是失败。
+   */
+  qualityProbeStream: async (
+    items: QualityProbeItem[],
+    onResult: (result: QualityProbeResult) => void,
+    signal?: AbortSignal
+  ): Promise<void> => {
+    const res = await fetch('/api/quality?stream=1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items }),
+      signal,
+    });
+    throwForAuthStatus(res);
+    if (!res.ok || !res.body) throw new ApiError(`请求失败 (${res.status})`, res.status);
+
+    await consumeNdjson<QualityProbeResult>(res, onResult);
   },
 
   douban: (type: 'movie' | 'tv', tag: string, pageStart: number, pageSize: number, signal?: AbortSignal) => {

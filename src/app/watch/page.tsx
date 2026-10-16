@@ -21,6 +21,7 @@ import { enqueueDownload } from '@/components/download-manager';
 import { Icon } from '@/components/icon';
 import { useAuth } from '@/components/auth';
 import { resolveSource, useAppStore } from '@/lib/store';
+import { qualityKey } from '@/lib/quality';
 import {
   clearProgress,
   progressKeyOf,
@@ -248,6 +249,13 @@ function WatchContent() {
                   onTimeUpdate={handleProgress}
                   onPause={handleProgress}
                   onEnded={handleEnded}
+                  onQuality={(height) => {
+                    // 播放实测是最权威的画质来源，回写后搜索列表里该「源 + 影片」直接显示
+                    if (!sourceKey || !vodId) return;
+                    useAppStore.getState().setQuality({
+                      [qualityKey(sourceKey, vodId)]: { height, from: 'play', timestamp: Date.now() },
+                    });
+                  }}
                 />
               ) : (
                 <div className="w-full h-full flex items-center justify-center">

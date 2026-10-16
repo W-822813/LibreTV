@@ -2,7 +2,8 @@
 
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
-import type { SourceConfig, LiveSourceConfig, SourceSearchOutcome } from './types';
+import type { QualityEntry, SourceConfig, LiveSourceConfig, SourceSearchOutcome } from './types';
+import { isQualityEntryFresh, mergeQualityEntries, qualityKey } from './quality';
 import { clearLiveProbeResultsDb, loadLiveProbeResults, saveLiveProbeResults } from './db';
 import { PERSIST_KEY, createThrottledStorage } from './persist-storage';
 
@@ -197,6 +198,8 @@ interface AppState extends AppSettings {
   liveProbeResults: Record<string, LiveProbeEntry>;
   /** 点播源健康度（随搜索滚动更新，跨会话持久化） */
   sourceHealth: Record<string, SourceHealthEntry>;
+  /** 画质缓存（按 `sourceKey:vodId`）：播放实测与搜索时懒探测共用一份 */
+  qualityMap: Record<string, QualityEntry>;
   /** 已出现过的 env 预置订阅 URL（持久化：用户删除后不再被自动加回） */
   envSubsSeen: string[];
   addCustomApi: (api: Omit<SourceConfig, 'key'> & { key?: string }) => void;
@@ -251,6 +254,12 @@ interface AppState extends AppSettings {
   recordSourceHealth: (outcomes: SourceSearchOutcome[]) => SourceDisableEvent[];
   /** 清除单个源的健康度记录（手动恢复入口） */
   clearSourceHealth: (key: string) => void;
+  /**
+   * 写入画质记录（播放实测与懒探测共用同一份缓存）。
+   * 实测值优先级高于探测值：解析 m3u8 得到的只是源站声明的档位，
+   * 播放时的 videoHeight 才是真实分辨率，实测一旦拿到就覆盖探测结果。
+   */
+  setQuality: (entries: Record<string, QualityEntry>) => void;
   markEnvSubsSeen: (urls: string[]) => void;
   updateSettings: (patch: Partial<Omit<AppSettings, 'customAPIs' | 'selectedKeys'>>) => void;
 }
@@ -287,6 +296,7 @@ export const useAppStore = create<AppState>()(
       liveRecent: [],
       liveProbeResults: {},
       sourceHealth: {},
+      qualityMap: {},
       envSubsSeen: [],
       selectedKeys: [],
       yellowFilter: true,
@@ -708,6 +718,11 @@ export const useAppStore = create<AppState>()(
         set({ envSubsSeen: [...seen] });
       },
 
+      setQuality: (entries) => {
+        // 合并与淘汰规则见 mergeQualityEntries（纯函数，单独覆盖了优先级与 TTL 的单测）
+        set({ qualityMap: mergeQualityEntries(get().qualityMap, entries) });
+      },
+
       updateSettings: (patch) => {
         // 用户主动修改推荐数据源 / 封面图加载方式时打上「已选择」标记：此后部署者的
         // DEFAULT_RECOMMEND_SOURCE / DEFAULT_IMAGE_MODE 默认值不再覆盖该用户的选择
@@ -780,6 +795,7 @@ export const useAppStore = create<AppState>()(
         liveFavorites: s.liveFavorites,
         liveRecent: s.liveRecent,
         sourceHealth: s.sourceHealth,
+        qualityMap: s.qualityMap,
         envSubsSeen: s.envSubsSeen,
         yellowFilter: s.yellowFilter,
         adFilter: s.adFilter,
@@ -862,6 +878,30 @@ export function isSourceDisabled(
  * 与 isSourceDisabled 分开判断：一个是用户主动关的、一个是系统按连续失败关的，
  * 提示文案与恢复方式都不同，混在一起用户就看不懂源为什么不生效了。
  */
+/**
+ * 读取某「源 + 影片」的画质记录（直接查内存态，不订阅 store）。
+ * 结果列表一次可能有十几张卡片 × 十几个来源，订阅整个 map 会让每次探测
+ * 结果都触发所有卡片重渲染，因此只在展开面板 / 探测回调时用 getState 读。
+ */
+export function readQuality(sourceKey: string, vodId: string): QualityEntry | undefined {
+  const entry = useAppStore.getState().qualityMap[qualityKey(sourceKey, vodId)];
+  // 过期条目按「没有结论」处理：持久化回来后 TTL 只在写入时清理过，
+  // 直接返回会让旧画质一直显示，且因为被认为已有结论而永远不重探
+  return entry && isQualityEntryFresh(entry) ? entry : undefined;
+}
+
+/** 批量读取：一次拿多个「源 + 影片」的画质，避免逐个 getState */
+export function readQualities(pairs: Array<{ sourceKey: string; vodId: string }>): Record<string, QualityEntry> {
+  const map = useAppStore.getState().qualityMap;
+  const out: Record<string, QualityEntry> = {};
+  for (const p of pairs) {
+    const key = qualityKey(p.sourceKey, p.vodId);
+    const entry = map[key];
+    if (entry && isQualityEntryFresh(entry)) out[key] = entry;
+  }
+  return out;
+}
+
 export function isInDisabledSubscription(
   state: Pick<AppState, 'subscriptions'>,
   key: string

@@ -38,6 +38,12 @@ interface PlayerShellProps {
   onTimeUpdate?: (position: number, duration: number) => void;
   onEnded?: () => void;
   onPause?: (position: number, duration: number) => void;
+  /**
+   * 实测画质（视频高度，像素）。
+   * 单码率 m3u8 / 直链的分辨率只能等解码后才知道，播放一次后回写缓存，
+   * 下次搜索同一部剧就能直接显示画质，不必再探测。
+   */
+  onQuality?: (height: number) => void;
   /** 恢复策略判源不可用（重试耗尽/格式硬失败）时回调：父级弹出换源面板 */
   onRequestSwitchSource?: (reason: string) => void;
 }
@@ -54,6 +60,7 @@ export function PlayerShell({
   onTimeUpdate,
   onEnded,
   onPause,
+  onQuality,
   onRequestSwitchSource,
 }: PlayerShellProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -69,11 +76,16 @@ export function PlayerShell({
   // 始终持有最新 props/回调，避免重建播放器
   const propsRef = useRef({
     url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey,
-    getRestorePosition, onTimeUpdate, onEnded, onPause, onRequestSwitchSource,
+    getRestorePosition, onTimeUpdate, onEnded, onPause, onQuality, onRequestSwitchSource,
   });
   propsRef.current = {
     url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey,
-    getRestorePosition, onTimeUpdate, onEnded, onPause, onRequestSwitchSource,
+    getRestorePosition, onTimeUpdate, onEnded, onPause, onQuality, onRequestSwitchSource,
+  };
+
+  /** 上报实测画质：多次上报取大值由调用方决定，这里只管把拿到的高度传出去 */
+  const reportQuality = (height: number) => {
+    if (height > 0) propsRef.current.onQuality?.(height);
   };
 
   // 跨集共享、每次换集重置的播放链路状态
@@ -85,6 +97,8 @@ export function PlayerShell({
   const videoErrorRetryUsedRef = useRef(false);
   // 进度恢复每集只执行一次（MANIFEST_PARSED 可能因代理回退再次触发）
   const restoredRef = useRef(false);
+  // 某些 HLS 源在 MANIFEST_PARSED 时 duration 仍未就绪，延迟到媒体元数据可用后恢复
+  const restoreCleanupRef = useRef<(() => void) | null>(null);
   // timeupdate 续跑预取的游标：必须按集清零，否则会沿用上一集的时间戳推迟首次续跑
   const lastPrefetchEnsureRef = useRef(0);
   // setupHls 可能改走代理形式，video:error 重试要用最近一次的地址
@@ -154,39 +168,72 @@ export function PlayerShell({
    * 注意：不销毁 ArtPlayer，只销毁并重建 hls，从而保留网页全屏等播放器状态。
    */
   const setupHls = (video: HTMLVideoElement, mediaUrl: string, allowProxyFallback: boolean) => {
+    restoreCleanupRef.current?.();
+    restoreCleanupRef.current = null;
     hlsRef.current?.destroy();
     currentMediaUrlRef.current = mediaUrl;
     const hls = new Hls(buildHlsConfig());
     hlsRef.current = hls;
 
+    let restoreInFlight = false;
+    const restoreAndStart = async () => {
+      if (restoredRef.current || restoreInFlight) return;
+
+      // MANIFEST_PARSED 早于 loadedmetadata 的 HLS 源很常见；没有有效时长时
+      // 先不消费 restoredRef，等 loadedmetadata/durationchange 后再重试。
+      const duration = artRef.current?.duration || video.duration || 0;
+      if (!Number.isFinite(duration) || duration <= 0) return;
+
+      restoreInFlight = true;
+      try {
+        const saved = (await propsRef.current.getRestorePosition?.()) ?? 0;
+        const currentDuration = artRef.current?.duration || video.duration || duration;
+        let prefetchAnchor = video.currentTime;
+        if (saved > 10 && Number.isFinite(currentDuration) && saved < currentDuration - 2) {
+          if (artRef.current) artRef.current.currentTime = saved;
+          prefetchAnchor = saved;
+          showHint(`已从 ${formatTime(saved)} 继续播放`);
+        }
+        restoredRef.current = true;
+        restoreCleanupRef.current?.();
+        restoreCleanupRef.current = null;
+        ensurePrefetch(mediaUrl, prefetchAnchor);
+        video.play().catch(() => {});
+      } catch {
+        // IndexedDB 读取失败时不阻塞播放，后续事件仍可再次尝试恢复。
+      } finally {
+        restoreInFlight = false;
+      }
+    };
+
+    const restoreEvents = ['loadedmetadata', 'durationchange', 'canplay'] as const;
+    const onRestoreEvent = () => { void restoreAndStart(); };
+    restoreEvents.forEach((event) => video.addEventListener(event, onRestoreEvent));
+    restoreCleanupRef.current = () => {
+      restoreEvents.forEach((event) => video.removeEventListener(event, onRestoreEvent));
+    };
+
     hls.loadSource(mediaUrl);
     hls.attachMedia(video);
 
-    hls.on(Hls.Events.MANIFEST_PARSED, async () => {
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
       recoveryRef.current?.markHealthy();
-      // 预取锚点：恢复进度时直接取恢复目标。赋值后 video.currentTime 未必立刻反映
-      // （Safari 系），而 ensure 是以「锚点未变」为前提复用 parsing 中的运行的——
-      // 这里读到旧值会把窗口建在片头，且白等一次纠错重建。
-      let prefetchAnchor = video.currentTime;
-      // 进度恢复（每集一次）：优先 URL position，其次 IndexedDB 记录
-      if (!restoredRef.current) {
-        restoredRef.current = true;
-        try {
-          const saved = (await propsRef.current.getRestorePosition?.()) ?? 0;
-          const duration = artRef.current?.duration || 0;
-          if (saved > 10 && duration > 0 && saved < duration - 2) {
-            if (artRef.current) artRef.current.currentTime = saved;
-            prefetchAnchor = saved;
-            showHint(`已从 ${formatTime(saved)} 继续播放`);
-          }
-        } catch { /* 忽略恢复失败 */ }
-      }
-      // 新集立即预取（否则要等 timeupdate 的 30s 节流，起播初期无缓存）
-      ensurePrefetch(mediaUrl, prefetchAnchor);
-      video.play().catch(() => {});
+      // master playlist 的档位高度：多码率源在这里就能拿到上限
+      const heights = hls.levels
+        .map((level) => level.height)
+        .filter((h): h is number => typeof h === 'number' && h > 0);
+      if (heights.length > 0) reportQuality(Math.max(...heights));
+      // 进度恢复改由 restoreAndStart 处理：duration 未就绪时不消费标记，挂事件重试
+      void restoreAndStart();
     });
     // 播放链路恢复（FRAG_LOADED / MANIFEST_PARSED）：静默窗外清零连续失败计数
     hls.on(Hls.Events.FRAG_LOADED, () => recoveryRef.current?.markHealthy());
+    // 单码率源在 MANIFEST 阶段拿不到 height（清单尚未解析），这里补一次。
+    // 注意 data.level 是档位下标，分辨率在 levelInfo 上
+    hls.on(Hls.Events.LEVEL_LOADED, (_evt, data) => {
+      const height = data.levelInfo?.height;
+      if (typeof height === 'number') reportQuality(height);
+    });
     // 分片真正进入 MSE buffer 才算媒体恢复：此时视频轨可渲染，错误态可解除
     hls.on(Hls.Events.FRAG_BUFFERED, () => {
       mediaHealthyRef.current = true;
@@ -260,6 +307,9 @@ export function PlayerShell({
   useEffect(() => {
     if (!containerRef.current || !propsRef.current.url) return;
     const initialUrl = propsRef.current.url;
+    // ArtPlayer 默认 3 秒才隐藏控制栏；播放器失去鼠标悬停后缩短为 0.8 秒。
+    const previousControlHideTime = Artplayer.CONTROL_HIDE_TIME;
+    Artplayer.CONTROL_HIDE_TIME = 800;
 
     // 初始化每集状态
     mediaHealthyRef.current = true;
@@ -301,6 +351,23 @@ export function PlayerShell({
       },
     });
     artRef.current = art;
+
+    /**
+     * 读解码后的真实分辨率。
+     * 单码率 m3u8 / mp4 直链的清单里没有画质字段，服务端无论如何探测不到，
+     * 只有 video 元素的 videoHeight 是真的——这是「播放一次即记住画质」链路的唯一数据源。
+     * loadedmetadata 在部分浏览器上 videoHeight 仍为 0，因此 resize / canplay / playing
+     * 各补一次机会，不能只赌单一事件时机。
+     */
+    const reportVideoHeight = () => {
+      const height = art.video?.videoHeight;
+      if (typeof height === 'number' && height > 0) reportQuality(height);
+    };
+    art.on('video:loadedmetadata', reportVideoHeight);
+    art.on('video:canplay', reportVideoHeight);
+    // resize 不在 ArtPlayer 的视频事件转发表里，直接挂原生事件
+    art.video?.addEventListener('resize', reportVideoHeight);
+
     art.on('video:loadedmetadata', () => {
       // ArtPlayer 运行时支持 title 选项（类型定义未覆盖），用于界面标题展示
       try {
@@ -315,6 +382,7 @@ export function PlayerShell({
       // 仅在媒体真正恢复（有分片进入 buffer）后清错误遮罩：
       // 否则「视频轨挂了、音频轨先播出来」时会清掉遮罩，留下黑屏假死态
       if (mediaHealthyRef.current) setError('');
+      reportVideoHeight();
     });
     art.on('video:error', () => {
       mediaHealthyRef.current = false;
@@ -402,6 +470,25 @@ export function PlayerShell({
     let originalRate = 1.0;
     const el = containerRef.current;
 
+    // 全屏时播放器覆盖整个视口，无法依赖 mouseleave 判断“移出播放器”。
+    // 改为按鼠标活动计时：停止移动后快速收起控制栏，移动时立即显示。
+    let controlHideTimer: ReturnType<typeof setTimeout> | null = null;
+    const showControlsOnPointerMove = () => {
+      art.controls.show = true;
+      if (controlHideTimer) clearTimeout(controlHideTimer);
+      controlHideTimer = setTimeout(() => {
+        if (!art.setting.show) art.controls.show = false;
+      }, 800);
+    };
+    const hideControlsOnMouseLeave = () => {
+      if (controlHideTimer) clearTimeout(controlHideTimer);
+      controlHideTimer = null;
+      art.controls.show = false;
+    };
+    el?.addEventListener('mousemove', showControlsOnPointerMove);
+    el?.addEventListener('mouseleave', hideControlsOnMouseLeave);
+    showControlsOnPointerMove();
+
     const onTouchStart = (e: TouchEvent) => {
       if (art.video?.paused) return;
       // 已有触控在处理时忽略新手指：否则第二指会把 originalRate 捕获成 3.0，
@@ -461,6 +548,13 @@ export function PlayerShell({
       el?.removeEventListener('touchcancel', onTouchEnd);
       el?.removeEventListener('touchmove', onTouchMove);
       el?.removeEventListener('contextmenu', onContextMenu);
+      art.video?.removeEventListener('resize', reportVideoHeight);
+      el?.removeEventListener('mousemove', showControlsOnPointerMove);
+      el?.removeEventListener('mouseleave', hideControlsOnMouseLeave);
+      if (controlHideTimer) clearTimeout(controlHideTimer);
+      restoreCleanupRef.current?.();
+      restoreCleanupRef.current = null;
+      Artplayer.CONTROL_HIDE_TIME = previousControlHideTime;
       hlsRef.current?.destroy();
       hlsRef.current = null;
       recoveryRef.current?.dispose();

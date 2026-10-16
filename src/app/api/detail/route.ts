@@ -42,9 +42,10 @@ export async function GET(req: Request) {
   }
 
   try {
-    // 命中 60s 缓存直接返回（仅缓存成功拿到剧集的结果）
-    const detailRootForCache = (source.detail || baseUrl || '').replace(/\/+$/, '');
-    const cacheKey = `detail:${source.url}|${detailRootForCache}|${id}`;
+    // 详情页根地址：显式 detail 优先，其次 baseUrl 参数，最后用接口地址的 origin 推导
+    // （Apple CMS 的详情页通常与接口同域）。脏 URL 会让 new URL 抛错，由外层 catch 兜底
+    const detailRoot = (source.detail || baseUrl || new URL(source.url).origin).replace(/\/+$/, '');
+    const cacheKey = `detail:${source.url}|${detailRoot}|${id}`;
     const cached = getCache<VideoDetail>(cacheKey);
     if (cached) {
       return NextResponse.json(cached);
@@ -74,9 +75,8 @@ export async function GET(req: Request) {
       }
     }
 
-    // 2) 详情页 HTML 提取（detail 地址优先，否则用 API 地址推导）
-    const detailRoot = (source.detail || baseUrl || '').replace(/\/+$/, '');
-    if (!resolved && detailRoot && /^https?:\/\//.test(detailRoot)) {
+    // 2) 详情页 HTML 提取
+    if (!resolved && /^https?:\/\//.test(detailRoot)) {
       const detailVerdict = await checkUpstreamAllowed(detailRoot);
       if (!detailVerdict.ok) {
         return NextResponse.json({ error: detailVerdict.reason }, { status: 400 });

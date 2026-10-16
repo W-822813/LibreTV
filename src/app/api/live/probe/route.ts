@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { guardRequest, jsonError } from '@/lib/api-guard';
 import { fetchUpstreamWithMeta } from '@/lib/fetch-utils';
+import { withHostLimit } from '@/lib/host-gate';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -390,59 +391,6 @@ async function probeOne(url: string): Promise<ProbeOutcome> {
   }
 }
 
-/**
- * 全局按 host 限并发：IPTV 列表里同一运营商的几十个频道常共用一个 host，
- * 批量测活若不限流，会以「客户端多批次 × 服务端 CONCURRENCY」的并发冲击同一源，
- * 弱源服务器会被打挂甚至封掉本服务 IP（表现为越测越红）。
- * 同一 host 最多 PER_HOST_CONCURRENCY 个在途探测，跨请求共享（模块级闸门），
- * 不同 host 互不影响；名额满时 FIFO 排队，空闲闸门及时清理避免 Map 无界增长。
- */
-const PER_HOST_CONCURRENCY = 3;
-
-const hostGates = new Map<string, { active: number; waiters: (() => void)[] }>();
-
-function hostOf(url: string): string {
-  try {
-    return new URL(url).host;
-  } catch {
-    return url;
-  }
-}
-
-/** 取一个该 host 的在途名额，返回释放函数；名额满时排队等待 */
-function acquireHostSlot(host: string): Promise<() => void> {
-  let gate = hostGates.get(host);
-  if (!gate) {
-    gate = { active: 0, waiters: [] };
-    hostGates.set(host, gate);
-  }
-  const g = gate;
-  return new Promise((resolve) => {
-    const take = () => {
-      g.active++;
-      resolve(() => {
-        g.active--;
-        // 唤醒的等待者同步接管名额（active-- 后立即 ++），不留被新请求插队的竞态窗口
-        const next = g.waiters.shift();
-        if (next) next();
-        else if (g.active === 0) hostGates.delete(host);
-      });
-    };
-    if (g.active < PER_HOST_CONCURRENCY) take();
-    else g.waiters.push(take);
-  });
-}
-
-/** 在 host 闸门内探测单个频道（probeOne 内部已兜底，不会抛出） */
-async function probeWithHostLimit(url: string): Promise<ProbeOutcome> {
-  const release = await acquireHostSlot(hostOf(url));
-  try {
-    return await probeOne(url);
-  } finally {
-    release();
-  }
-}
-
 const NDJSON_HEADERS = {
   'Content-Type': 'application/x-ndjson; charset=utf-8',
   'Cache-Control': 'no-store, no-transform',
@@ -490,7 +438,7 @@ function ndjsonResponse(urls: string[], reqSignal: AbortSignal): Response {
         while (cursor < pending.length) {
           if (closed || reqSignal.aborted) return;
           const url = pending[cursor++];
-          const outcome = await probeWithHostLimit(url);
+          const outcome = await withHostLimit(url, () => probeOne(url));
           if (closed || reqSignal.aborted) return;
           cacheSet(url, outcome);
           send(outcome);
@@ -577,7 +525,7 @@ export async function POST(req: Request) {
   const worker = async () => {
     while (cursor < pending.length) {
       const url = pending[cursor++];
-      const outcome = await probeWithHostLimit(url);
+      const outcome = await withHostLimit(url, () => probeOne(url));
       cacheSet(url, outcome);
       outcomes.set(url, outcome);
     }
