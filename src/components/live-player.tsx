@@ -4,6 +4,8 @@ import { useEffect, useRef, useState } from 'react';
 import Artplayer from 'artplayer';
 import Hls, { type HlsConfig } from 'hls.js';
 import { Spinner } from './states';
+import { prefersTouchPointer } from '@/lib/touch-pointer';
+import { ART_DEFAULT_CONTROL_HIDE_MS, TOUCH_CONTROL_HIDE_MS } from '@/lib/control-hide';
 
 /**
  * 直播播放器：与点播 player-shell 完全独立。
@@ -290,6 +292,11 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel }: LivePla
         click: () => onNextChannel(),
       });
     }
+    // 触屏没有 hover，原生 3 秒自动隐藏会让直播控制栏（上一台/下一台）点不到
+    // （issue #937）：触屏常驻、由点按视频 toggle 收起；桌面行为不变
+    const touchPointer = prefersTouchPointer();
+    if (touchPointer) Artplayer.CONTROL_HIDE_TIME = TOUCH_CONTROL_HIDE_MS;
+
     const art = new Artplayer({
       container: containerRef.current,
       url,
@@ -366,6 +373,8 @@ export function LivePlayer({ url, title, onPrevChannel, onNextChannel }: LivePla
       cleanupEngines();
       art.destroy();
       artRef.current = null;
+      // CONTROL_HIDE_TIME 是全局 static：恢复库默认值，避免影响后续挂载的其它播放器
+      if (touchPointer) Artplayer.CONTROL_HIDE_TIME = ART_DEFAULT_CONTROL_HIDE_MS;
       destroyed = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

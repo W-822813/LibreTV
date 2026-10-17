@@ -12,6 +12,12 @@ import {
 } from '@/lib/video-prefetcher';
 import { loadCacheSettings } from '@/lib/video-cache';
 import { formatTime } from '@/lib/utils';
+import { prefersTouchPointer } from '@/lib/touch-pointer';
+import {
+  ART_DEFAULT_CONTROL_HIDE_MS,
+  DESKTOP_CONTROL_HIDE_MS,
+  TOUCH_CONTROL_HIDE_MS,
+} from '@/lib/control-hide';
 
 /**
  * 播放器外壳：ArtPlayer + hls.js（旧版 player.js 的 React 化）。
@@ -307,9 +313,11 @@ export function PlayerShell({
   useEffect(() => {
     if (!containerRef.current || !propsRef.current.url) return;
     const initialUrl = propsRef.current.url;
-    // ArtPlayer 默认 3 秒才隐藏控制栏；播放器失去鼠标悬停后缩短为 0.8 秒。
-    const previousControlHideTime = Artplayer.CONTROL_HIDE_TIME;
-    Artplayer.CONTROL_HIDE_TIME = 800;
+    // ArtPlayer 默认 3 秒才隐藏控制栏；桌面失去鼠标悬停后缩短为 0.8 秒。
+    // 触屏没有 hover，自动隐藏会让按钮来不及点（issue #937）：改为常驻，
+    // 由「点按视频 toggle」收起。CONTROL_HIDE_TIME 是 static，创建后修改立即生效。
+    const touchPointer = prefersTouchPointer();
+    Artplayer.CONTROL_HIDE_TIME = touchPointer ? TOUCH_CONTROL_HIDE_MS : DESKTOP_CONTROL_HIDE_MS;
 
     // 初始化每集状态
     mediaHealthyRef.current = true;
@@ -485,9 +493,14 @@ export function PlayerShell({
       controlHideTimer = null;
       art.controls.show = false;
     };
-    el?.addEventListener('mousemove', showControlsOnPointerMove);
-    el?.addEventListener('mouseleave', hideControlsOnMouseLeave);
-    showControlsOnPointerMove();
+    // 触屏不监听 mousemove/mouseleave，也跳过初始显示：iOS 点按视频的合成事件
+    // 序列是 mousemove → click，若 mousemove 先把 show 置 true，紧跟的 ArtPlayer
+    // click toggle 会把它翻回 false——控制栏「闪一下即隐」，正是 issue #937 的病灶
+    if (!touchPointer) {
+      el?.addEventListener('mousemove', showControlsOnPointerMove);
+      el?.addEventListener('mouseleave', hideControlsOnMouseLeave);
+      showControlsOnPointerMove();
+    }
 
     const onTouchStart = (e: TouchEvent) => {
       if (art.video?.paused) return;
@@ -554,7 +567,7 @@ export function PlayerShell({
       if (controlHideTimer) clearTimeout(controlHideTimer);
       restoreCleanupRef.current?.();
       restoreCleanupRef.current = null;
-      Artplayer.CONTROL_HIDE_TIME = previousControlHideTime;
+      Artplayer.CONTROL_HIDE_TIME = ART_DEFAULT_CONTROL_HIDE_MS;
       hlsRef.current?.destroy();
       hlsRef.current = null;
       recoveryRef.current?.dispose();

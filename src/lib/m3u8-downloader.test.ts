@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { decryptSegment } from './m3u8-downloader';
+import { decryptSegment, PauseResumeController, runDownloadJob, type DownloadJobOptions, type DownloadProgress } from './m3u8-downloader';
 import { parseM3u8Playlist } from './m3u8-parse';
 
 const KEY = crypto.getRandomValues(new Uint8Array(16));
@@ -88,5 +88,196 @@ describe('parseM3u8Playlist · mediaSequence 与 AES URI 绝对化', () => {
     );
     const parsed = await parseM3u8Playlist('https://cdn.example.com/a.m3u8');
     expect(parsed.mediaSequence).toBe(0);
+  });
+});
+
+const PLAYLIST = [
+  '#EXTM3U',
+  '#EXT-X-VERSION:3',
+  '#EXT-X-TARGETDURATION:6',
+  '#EXT-X-PLAYLIST-TYPE:VOD',
+  '#EXTINF:4,',
+  's0.ts',
+  '#EXTINF:4,',
+  's1.ts',
+  '#EXTINF:4,',
+  's2.ts',
+  '#EXT-X-ENDLIST',
+].join('\n');
+
+/** 极简 Cache Storage 替身：只实现 runDownloadJob 用到的 match/put/keys/delete */
+function stubCaches(onPut?: () => Promise<void>): void {
+  const store = new Map<string, ArrayBuffer>();
+  const cache = {
+    match: async (req: Request) => {
+      const hit = store.get(req.url);
+      return hit ? new Response(hit.slice(0)) : undefined;
+    },
+    put: async (req: Request, res: Response) => {
+      if (onPut) {
+        await onPut();
+        return;
+      }
+      store.set(req.url, await res.arrayBuffer());
+    },
+    keys: async () => [...store.keys()].map((u) => new Request(u)),
+    delete: async (req: Request) => store.delete(req.url),
+  };
+  vi.stubGlobal('caches', { open: async () => cache });
+}
+
+function jobOptions(overrides: Partial<DownloadJobOptions> = {}): DownloadJobOptions {
+  return {
+    taskId: 'task-1',
+    url: 'https://cdn.example.com/index.m3u8',
+    title: '测试剧集',
+    format: 'TS',
+    concurrency: 1,
+    signal: new AbortController().signal,
+    pause: new PauseResumeController(),
+    onProgress: () => {},
+    target: { kind: 'memory', write: async () => {}, close: async () => {}, abort: async () => {} },
+    ...overrides,
+  };
+}
+
+describe('runDownloadJob · 源站缺片与存储错误', () => {
+  it('分片 404 视为确定性缺失：不重试、立即失败并提示换源', async () => {
+    stubCaches();
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calls.push(url);
+        if (url.endsWith('index.m3u8')) return new Response(PLAYLIST, { status: 200 });
+        if (url.endsWith('s1.ts')) return new Response('', { status: 404 });
+        return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10]), { status: 200 });
+      })
+    );
+
+    const job = runDownloadJob(jobOptions());
+    await expect(job).rejects.toThrow(/分片 2 源站缺失/);
+    await expect(job).rejects.toThrow(/建议更换来源/);
+    // 不重试：m3u8 一次 + s0 一次 + s1 一次（整集失败后 s2 不再请求）
+    expect(calls.filter((u) => u.endsWith('.ts'))).toEqual([
+      'https://cdn.example.com/s0.ts',
+      'https://cdn.example.com/s1.ts',
+    ]);
+  });
+
+  it('5xx 仍走退避重试，重试耗尽后才失败', async () => {
+    stubCaches();
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('index.m3u8')) return new Response(PLAYLIST, { status: 200 });
+      return new Response('', { status: 503 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const job = runDownloadJob(jobOptions());
+    const assertion = expect(job).rejects.toThrow(/已重试 3 次/);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await assertion;
+
+    const segCalls = fetchMock.mock.calls.filter(([input]) => String(input).endsWith('.ts'));
+    expect(segCalls).toHaveLength(3);
+    vi.useRealTimers();
+  });
+
+  it('缓存写入失败（如配额不足）时给出可读提示', async () => {
+    stubCaches(async () => {
+      throw new DOMException('Quota exceeded', 'QuotaExceededError');
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('index.m3u8')) return new Response(PLAYLIST, { status: 200 });
+        return new Response(new Uint8Array([0x47]), { status: 200 });
+      })
+    );
+
+    await expect(runDownloadJob(jobOptions())).rejects.toThrow(/存储空间可能不足/);
+  });
+
+  it('环境无 Cache Storage（HTTP 访问 / 老浏览器）：退化为串行边下边写而非直接失败', async () => {
+    // 不提供 caches：等价于非安全上下文。旧行为是抛「不支持浏览器缓存」，
+    // 现改为串行下载 + 立即写出（无断点、并发 1），功能仍可用
+    vi.stubGlobal('caches', undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('index.m3u8')) return new Response(PLAYLIST, { status: 200 });
+        return new Response(new Uint8Array([0x47]), { status: 200 });
+      })
+    );
+    const written: number[] = [];
+    const progress: DownloadProgress[] = [];
+
+    await runDownloadJob(
+      jobOptions({
+        target: {
+          kind: 'memory',
+          write: async (d) => void written.push(d.byteLength),
+          close: async () => {},
+          abort: async () => {},
+        },
+        onProgress: (p) => progress.push(p),
+      })
+    );
+
+    expect(written).toHaveLength(3);
+    expect(progress.at(-1)?.status).toBe('done');
+  });
+
+  it('proxy 开启：m3u8 经 /api/proxy 拉取（直连被 CORS / 混合内容拦下时的兜底）', async () => {
+    stubCaches();
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calls.push(url);
+        if (url.startsWith('/api/proxy?')) return new Response(PLAYLIST, { status: 200 });
+        return new Response(new Uint8Array([0x47]), { status: 200 });
+      })
+    );
+
+    await runDownloadJob(jobOptions({ proxy: true }));
+
+    expect(calls[0]).toBe(`/api/proxy?url=${encodeURIComponent('https://cdn.example.com/index.m3u8')}`);
+    expect(calls).not.toContain('https://cdn.example.com/index.m3u8');
+  });
+
+  it('跨域或域名不可达导致的 Failed to fetch 翻译成「建议更换来源」', async () => {
+    stubCaches();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new TypeError('Failed to fetch');
+      })
+    );
+
+    await expect(runDownloadJob(jobOptions())).rejects.toThrow(
+      /无法直连该来源（跨域限制或域名不可达），建议更换来源/
+    );
+  });
+
+  it('HTTPS 页面遇到 http 来源时提示混合内容被拦截', async () => {
+    stubCaches();
+    vi.stubGlobal('location', { protocol: 'https:' });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new TypeError('Failed to fetch');
+      })
+    );
+
+    await expect(runDownloadJob(jobOptions({ url: 'http://cdn.example.com/index.m3u8' }))).rejects.toThrow(
+      /混合内容被拦截/
+    );
   });
 });
