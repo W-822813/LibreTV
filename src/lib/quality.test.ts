@@ -2,10 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   QUALITY_FAIL_TTL_MS,
   QUALITY_TTL_MS,
+  describeQualityBadge,
+  failureReasonLabel,
   inferHeightFromBitrate,
   isQualityEntryFresh,
+  isRetryableTimeout,
   mergeQualityEntries,
   qualityLabel,
+  summarizeQuality,
 } from './quality';
 import { parseBestHeight, parseMediaPlaylist } from './quality-probe';
 import type { QualityEntry } from './types';
@@ -259,5 +263,103 @@ describe('mergeQualityEntries', () => {
     expect(Object.keys(next)).toHaveLength(400);
     expect(next.k0).toBeUndefined(); // 最旧的一条被淘汰
     expect(next.fresh).toBeDefined();
+  });
+});
+
+describe('describeQualityBadge', () => {
+  const entry = (patch: Partial<QualityEntry> = {}): QualityEntry => ({
+    from: 'probe',
+    timestamp: 1_700_000_000_000,
+    ...patch,
+  });
+
+  it('探测中优先于已有结果：重试时不该还挂着旧结论', () => {
+    expect(describeQualityBadge(entry({ height: 720 }), true)).toMatchObject({ kind: 'loading', retryable: false });
+  });
+
+  it('尚未探测时返回 undefined：不渲染，避免与「未知」混淆', () => {
+    expect(describeQualityBadge(undefined, false)).toBeUndefined();
+  });
+
+  it('有档位：探测值与实测值的 tooltip 区分数据来源', () => {
+    expect(describeQualityBadge(entry({ height: 1080 }))).toMatchObject({ kind: 'value', label: '1080P' });
+    expect(describeQualityBadge(entry({ height: 1080, from: 'play' }))?.title).toContain('实测');
+    expect(describeQualityBadge(entry({ height: 1080, from: 'probe' }))?.title).toContain('播放列表');
+  });
+
+  it('无高度无错误 = 未知，且不可重试（源站本就不给信息）', () => {
+    const view = describeQualityBadge(entry());
+    expect(view).toMatchObject({ kind: 'unknown', retryable: false });
+    expect(view?.title).toContain('单码率');
+  });
+
+  it('有错误 = 未探到，可重试，且原因写进 tooltip', () => {
+    const view = describeQualityBadge(entry({ error: 'HTTP 403' }));
+    expect(view).toMatchObject({ kind: 'failed', retryable: true });
+    expect(view?.title).toContain('HTTP 403');
+  });
+
+  it('失败但带有高度时按有档位展示（部分源先失败后回填）', () => {
+    expect(describeQualityBadge(entry({ height: 720, error: 'HTTP 500' }))).toMatchObject({ kind: 'value', label: '720P' });
+  });
+});
+
+describe('summarizeQuality', () => {
+  const T = 1_700_000_000_000;
+  const probe = (height?: number, error?: string): QualityEntry => ({ height, from: 'probe', error, timestamp: T });
+
+  it('空输入：没有结论也不虚报总数', () => {
+    expect(summarizeQuality([])).toEqual({ best: undefined, known: 0, failed: 0, total: 0 });
+  });
+
+  it('取最高档并统计命中/失败/总数', () => {
+    const summary = summarizeQuality([probe(720), probe(1080), probe(), probe(undefined, 'HTTP 403')]);
+    expect(summary).toEqual({ best: '1080P', known: 2, failed: 1, total: 4 });
+  });
+
+  it('未探测条目（undefined）不计入分母，进度不会显得永远差几条', () => {
+    expect(summarizeQuality([probe(720), undefined, undefined])).toEqual({
+      best: '720P',
+      known: 1,
+      failed: 0,
+      total: 1,
+    });
+  });
+
+  it('全部测不出时没有 best，但仍是有效结论（total 计入）', () => {
+    expect(summarizeQuality([probe(), probe()])).toEqual({ best: undefined, known: 0, failed: 0, total: 2 });
+  });
+
+  it('实测与探测混合时取较大值（实测可把单码率源补上）', () => {
+    const play: QualityEntry = { height: 2160, from: 'play', timestamp: T };
+    expect(summarizeQuality([probe(720), play]).best).toBe('4K');
+  });
+});
+
+describe('失败原因标签', () => {
+  it('源站拒绝与超时各有短标签', () => {
+    expect(failureReasonLabel('HTTP 403')).toBe('防盗链');
+    expect(failureReasonLabel('画质探测超时')).toBe('超时');
+    expect(failureReasonLabel('未找到播放资源')).toBe('无资源');
+  });
+
+  it('传输层失败也要有标签：否则线上只剩裸「未测到」，无从判断哪一环挂了', () => {
+    expect(failureReasonLabel('探测请求被网关拦截（未收到任何响应）')).toBe('连接中断');
+    expect(failureReasonLabel('探测连接中途被断开（已收到部分结果，多为网关超时）')).toBe('连接中断');
+    expect(failureReasonLabel('探测请求没能送达服务器（网络或反向代理中断）')).toBe('连接中断');
+    expect(failureReasonLabel('请求失败 (502)')).toBe('网关异常');
+  });
+
+  it('无法归类的错误不硬造标签', () => {
+    expect(failureReasonLabel('fetch failed')).toBeUndefined();
+    expect(failureReasonLabel(undefined)).toBeUndefined();
+  });
+});
+
+describe('isRetryableTimeout', () => {
+  it('只把超时视作值得自动补探的失败', () => {
+    expect(isRetryableTimeout('画质探测超时')).toBe(true);
+    expect(isRetryableTimeout('HTTP 403')).toBe(false);
+    expect(isRetryableTimeout(undefined)).toBe(false);
   });
 });

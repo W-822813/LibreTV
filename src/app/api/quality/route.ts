@@ -14,8 +14,12 @@ interface QualityBody {
 /** 单次请求最多探测的条目数：一张卡片展开最多十几个源，留足余量且防止被刷 */
 const MAX_ITEMS = 50;
 
-/** 并发上限：一次打满十几个源容易触发源站限流，也会把服务端出站连接占满 */
-const CONCURRENCY = 6;
+/**
+ * 并发上限：一次打满十几个源容易触发源站限流，也会把服务端出站连接占满。
+ * 小内存 VPS 上并发过高时，探测峰值（64KB 文本 + 分片 + AES key）容易把容器顶到 OOM，
+ * 表现为浏览器整条 fetch 失败；降到 3 换取稳定，单批最坏时长仍在客户端看门狗（60s）内。
+ */
+const CONCURRENCY = 3;
 
 /** 探测成功缓存 30 分钟：源站短期内不会给同一部剧换片源 */
 const OK_CACHE_TTL = 30 * 60 * 1000;
@@ -132,14 +136,17 @@ export async function POST(req: Request) {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let closed = false;
-      const send = (result: QualityProbeResult) => {
+      const send = (payload: QualityProbeResult | { ping: true }) => {
         if (closed) return;
         try {
-          controller.enqueue(encoder.encode(JSON.stringify(result) + '\n'));
+          controller.enqueue(encoder.encode(JSON.stringify(payload) + '\n'));
         } catch {
           closed = true; // 客户端已断开
         }
       };
+      // 首字节心跳：客户端据此区分「请求被网关/反代拦下」与「探测过程本身失败」。
+      // 一行 10 字节，换来线上排障时最关键的一条信息。
+      send({ ping: true });
       await runWithConcurrency(items, CONCURRENCY, async (item) => {
         if (closed) return;
         send(await resolveItem(item));

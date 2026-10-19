@@ -149,22 +149,51 @@ export const api = {
   /**
    * 批量画质探测（NDJSON 流式）：展开来源面板时逐条回调，先到的源先显示画质。
    * 结果里的 height 缺失代表「测不出」（单码率 m3u8 / 直链 / 防盗链），不是失败。
+   *
+   * 传输层失败（请求没发出去 / 流中途断开）不再原样冒泡：调用方原先只能静默成
+   * 「未测到」，线上出问题时无法区分「网关拦了」「容器崩了」「探测本身失败」。
+   * 服务端开流即写一行心跳，收到过首字节说明请求确实进了应用，据此给出不同文案。
    */
   qualityProbeStream: async (
     items: QualityProbeItem[],
     onResult: (result: QualityProbeResult) => void,
     signal?: AbortSignal
   ): Promise<void> => {
-    const res = await fetch('/api/quality?stream=1', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ items }),
-      signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch('/api/quality?stream=1', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items }),
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      throw new ApiError('探测请求没能送达服务器（网络或反向代理中断）', 0);
+    }
     throwForAuthStatus(res);
     if (!res.ok || !res.body) throw new ApiError(`请求失败 (${res.status})`, res.status);
 
-    await consumeNdjson<QualityProbeResult>(res, onResult);
+    let firstByte = false;
+    try {
+      await consumeNdjson<QualityProbeResult | { ping: true }>(res, (event) => {
+        // 心跳行不是结果：收到它就证明请求确实进了 Next，后面的失败才归因于探测本身
+        if ('ping' in event) {
+          firstByte = true;
+          return;
+        }
+        firstByte = true;
+        onResult(event);
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      throw new ApiError(
+        firstByte
+          ? '探测连接中途被断开（已收到部分结果，多为网关超时）'
+          : '探测请求被网关拦截（未收到任何响应）',
+        0
+      );
+    }
   },
 
   douban: (type: 'movie' | 'tv', tag: string, pageStart: number, pageSize: number, signal?: AbortSignal) => {

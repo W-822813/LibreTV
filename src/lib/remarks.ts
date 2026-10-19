@@ -48,6 +48,27 @@ export function formatRemarks(raw?: string): string | undefined {
 }
 
 /**
+ * 选源列表里的紧凑备注。
+ *
+ * 「更新至1277集」在「源名 / 画质 / 集数」这一行里，前缀没有任何信息量，
+ * 却吃掉三分之一宽度并挤掉画质的存在感——压成「1277 集」即可。
+ * 非集数备注（HD国语 / 正片）剥掉无意义前缀后原样保留；
+ * 单集影片不显示集数（没有「更新到第几集」这回事）。
+ */
+export function compactRemarks(raw?: string): string | undefined {
+  const text = formatRemarks(raw);
+  if (!text) return undefined;
+  const episode = /^(?:全|更新至)(\d+)集$/.exec(text);
+  if (episode) {
+    const count = parseInt(episode[1], 10);
+    return count > 1 ? `${count} 集` : undefined;
+  }
+  const prefixed = /^(?:全|更(?:新至|新|至))\s*(.+)$/.exec(text);
+  if (prefixed) return prefixed[1].trim() || undefined;
+  return text;
+}
+
+/**
  * 推断整组（同一部剧的所有来源）的统一备注。
  *
  * 单看一个源补不出集数：标「已完结」的源就是没写总集数。但同一部剧的总集数是客观的，

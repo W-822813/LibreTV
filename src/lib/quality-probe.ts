@@ -35,8 +35,13 @@ const SEGMENT_PREFIX_BYTES = 96 * 1024;
 /** fMP4 的 init segment 很小，moov 就在里面 */
 const INIT_PREFIX_BYTES = 64 * 1024;
 
-/** 单条探测总死线：与搜索的单源死线同量级，避免一个慢源拖住整批 */
-export const QUALITY_PROBE_TIMEOUT_MS = 8000;
+/**
+ * 单条探测总死线。
+ * 一次探测要串行走 3~5 跳（列表接口 → m3u8 → init/分片 → 可能还有 AES key），
+ * 机房到国内源站的 RTT 远高于本地开发：8s 在线上经常只够握两次手，
+ * 于是可用源被误判成「未测到」。放宽到 12s，单跳仍各自受 6s 限制。
+ */
+export const QUALITY_PROBE_TIMEOUT_MS = 12000;
 
 /**
  * 分片解析的独立预算。

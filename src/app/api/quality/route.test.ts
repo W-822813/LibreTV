@@ -98,4 +98,21 @@ describe('POST /api/quality', () => {
     await POST(post([item('a', 'https://s.test/api')]));
     expect(state.calls).toBe(2);
   });
+
+  it('流式响应先写一行心跳，客户端据此区分「网关拦了」与「探测失败」', async () => {
+    const res = await POST(
+      new Request('https://local.test/api/quality?stream=1', {
+        method: 'POST',
+        body: JSON.stringify({ items: [item('a', 'https://s.test/api')] }),
+      })
+    );
+    expect(res.headers.get('content-type')).toContain('application/x-ndjson');
+
+    const lines = (await res.text())
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(lines[0]).toEqual({ ping: true });
+    expect(lines[1]).toMatchObject({ sourceKey: 'a', height: 1080 });
+  });
 });

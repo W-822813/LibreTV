@@ -1,5 +1,29 @@
 import { describe, expect, it } from 'vitest';
-import { formatRemarks, inferGroupRemarks } from './remarks';
+import { compactRemarks, formatRemarks, inferGroupRemarks } from './remarks';
+
+describe('compactRemarks', () => {
+  it('集数进度压成「N 集」：选源行里前缀没有信息量', () => {
+    expect(compactRemarks('更新至1277集')).toBe('1277 集');
+    expect(compactRemarks('全34集')).toBe('34 集');
+    expect(compactRemarks('第34集已完结')).toBe('34 集');
+  });
+
+  it('单集影片不显示集数（没有「更新到第几集」这回事）', () => {
+    expect(compactRemarks('全1集')).toBeUndefined();
+    expect(compactRemarks('更新至1集')).toBeUndefined();
+  });
+
+  it('非集数备注剥掉无意义前缀后保留内容', () => {
+    expect(compactRemarks('更新HD')).toBe('HD');
+    expect(compactRemarks('HD国语')).toBe('HD国语');
+  });
+
+  it('空值与「完结」类：完结不携带集数，按原样短文案返回', () => {
+    expect(compactRemarks(undefined)).toBeUndefined();
+    expect(compactRemarks('  ')).toBeUndefined();
+    expect(compactRemarks('已完结')).toBe('已完结');
+  });
+});
 
 describe('formatRemarks', () => {
   it('截图里那五种写法归一成两种结果', () => {

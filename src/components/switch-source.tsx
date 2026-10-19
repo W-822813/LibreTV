@@ -6,11 +6,14 @@ import { api } from '@/lib/client-api';
 import type { SourceConfig, SearchResultItem } from '@/lib/types';
 import { buildWatchUrl, cn } from '@/lib/utils';
 import { useAppStore, resolveSource } from '@/lib/store';
+import { qualityKey } from '@/lib/quality';
 import { useToast } from './toast';
 import { Icon } from './icon';
 import { SmartImage } from './smart-image';
 import { EmptyState, LoadingState } from './states';
 import { useFocusTrap } from './use-focus-trap';
+import { QualityBadge } from './quality-badge';
+import { useQualityProbe } from './use-quality-probe';
 
 /**
  * 换源面板：跨源按标题搜索 → 匹配同名/同前缀资源 → 并发测速（详情接口耗时）→ 按速度排序展示。
@@ -135,6 +138,16 @@ export function SwitchSourceModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentTitle, store.yellowFilter]);
 
+  const { qualities, probing, progress, probe, retry } = useQualityProbe(sources);
+
+  // 测速完成后补探画质：用户正是在这里比较来源，「快」和「清楚」要能一起看。
+  // 只探测速成功的候选——详情接口都打不通的源，再花 8s 探 m3u8 没有意义。
+  useEffect(() => {
+    if (phase !== 'done') return;
+    const targets = candidates.filter((c) => c.ok).map((c) => c.result);
+    if (targets.length > 0) probe(targets);
+  }, [phase, candidates, probe]);
+
   const sorted = [...candidates].sort((a, b) => {
     const aCurrent = a.source.key === currentSourceKey && String(a.result.vodId) === String(currentVodId);
     const bCurrent = b.source.key === currentSourceKey && String(b.result.vodId) === String(currentVodId);
@@ -190,6 +203,16 @@ export function SwitchSourceModal({
                   ? '正在测试各资源速率...'
                   : `共 ${sorted.length} 个来源 · ${sorted.filter((c) => c.ok).length} 个可用`}
             </p>
+            {phase === 'done' && progress.total > 0 && (
+              <p className="text-xs text-faint tabular-nums mt-0.5">
+                {progress.done < progress.total
+                  ? `画质探测中 ${progress.done}/${progress.total}`
+                  : progress.known > 0
+                    ? `画质已探到 ${progress.known}/${progress.total}`
+                    : // 一个都没探到不等于失败：多为单码率/直链，说清楚省得用户以为坏了
+                      '源站未提供画质'}
+              </p>
+            )}
           </div>
           <button className="p-1.5 rounded-md text-muted hover:text-content hover:bg-hover" onClick={onClose} aria-label="关闭">
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -210,11 +233,23 @@ export function SwitchSourceModal({
               const img = c.result.pic;
               const coverFailed = imgFailed[cardKey] ?? false;
               return (
-                <button
+                <div
                   key={`${c.source.key}_${c.result.vodId}`}
-                  className={cn('text-left group relative rounded-lg overflow-hidden bg-card transition-transform', !isCurrent && 'hover:scale-[1.03] cursor-pointer', isCurrent && 'cursor-default')}
+                  role="button"
+                  tabIndex={isCurrent ? -1 : 0}
+                  aria-disabled={isCurrent}
+                  className={cn(
+                    'text-left group relative rounded-lg overflow-hidden bg-card transition-transform',
+                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50',
+                    !isCurrent && 'hover:scale-[1.03] cursor-pointer',
+                    isCurrent && 'cursor-default'
+                  )}
                   onClick={() => !isCurrent && switchTo(c)}
-                  disabled={isCurrent}
+                  onKeyDown={(e) => {
+                    if (e.key !== 'Enter' && e.key !== ' ') return;
+                    e.preventDefault();
+                    if (!isCurrent) switchTo(c);
+                  }}
                 >
                   <div className="relative aspect-[2/3] bg-chip">
                     {img && !coverFailed ? (
@@ -247,9 +282,16 @@ export function SwitchSourceModal({
                     <div className="text-xs font-medium text-content truncate" title={c.source.name}>
                       {c.source.name}
                     </div>
-                    <div className="text-xs text-faint mt-0.5">{c.episodes ? `${c.episodes} 集` : '无资源'}</div>
+                    <div className="flex items-center justify-between gap-1 mt-0.5">
+                      <span className="text-xs text-faint">{c.episodes ? `${c.episodes} 集` : '无资源'}</span>
+                      <QualityBadge
+                        entry={qualities[qualityKey(c.source.key, c.result.vodId)]}
+                        loading={probing[qualityKey(c.source.key, c.result.vodId)]}
+                        onRetry={() => retry([c.result])}
+                      />
+                    </div>
                   </div>
-                </button>
+                </div>
               );
             })}
           </div>

@@ -16,7 +16,30 @@ export const QUALITY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
  * 失败原因多为瞬时（超时/限流/防盗链偶发拒绝），不能像成功结果那样存 30 天，
  * 否则偶发失败会被当成永久结论，用户再也看不到画质。
  */
-export const QUALITY_FAIL_TTL_MS = 10 * 60 * 1000;
+export const QUALITY_FAIL_TTL_MS = 2 * 60 * 1000;
+
+/**
+ * 失败原因短标签：徽章上直接显示「未测到·超时」比只藏在 tooltip 里有用，
+ * 触屏没有 hover，用户更需要一眼看出「该重试」还是「该换源」。
+ */
+export function failureReasonLabel(error?: string): string | undefined {
+  if (!error) return undefined;
+  // 传输层失败（请求没送达 / 流中途断）要排在「超时」之前：
+  // 这类文案本身就带「多为网关超时」的解释，先匹配超时会把归因指错
+  if (/中断|断开|送达|网关拦截/.test(error)) return '连接中断';
+  if (error.includes('超时')) return '超时';
+  if (/HTTP (401|403)/.test(error)) return '防盗链';
+  // 5xx 多为反代/网关回的错误页，和「源站不给画质」完全不是一回事
+  if (/HTTP 5\d\d|\(5\d\d\)/.test(error)) return '网关异常';
+  if (error.includes('未找到播放资源')) return '无资源';
+  if (error.includes('无效')) return '源无效';
+  return undefined;
+}
+
+/** 超时是唯一值得自动重试的失败：冷启动/CDN 抖动，同一条请求再打一次常能成 */
+export function isRetryableTimeout(error?: string): boolean {
+  return !!error && error.includes('超时');
+}
 
 /**
  * 条目是否仍在有效期内（唯一判定入口，写入与读取都走这里）。
@@ -118,6 +141,101 @@ export function mergeQualityEntries(
     for (const key of oldest) delete next[key];
   }
   return next;
+}
+
+// —— 反馈层：徽章状态与汇总 ——
+// 纯函数放这里（而非组件里）的原因：测试环境是 node（无 jsdom），
+// 把「该显示什么」和「怎么画」分开，四态与汇总口径才能被单测覆盖。
+
+export type QualityBadgeKind = 'loading' | 'value' | 'unknown' | 'failed';
+
+export interface QualityBadgeView {
+  kind: QualityBadgeKind;
+  /** 有档位时的展示文本（4K / 1080P / 720P…）；失败时为「未测到」 */
+  label?: string;
+  /** 失败原因短标签（超时 / 防盗链 / 无资源），供徽章就地展示 */
+  reason?: string;
+  /** tooltip：说明数据来源，或失败原因与下一步该做什么 */
+  title: string;
+  /** 只有「没够着」值得重试；源站本来就不给画质信息，重试多少次都一样 */
+  retryable: boolean;
+}
+
+/**
+ * 画质徽章四态。返回 undefined 表示「尚未探测过」——不渲染，
+ * 避免把「还没探」画成「未知」，两者对用户的含义完全不同。
+ */
+export function describeQualityBadge(
+  entry: QualityEntry | undefined,
+  loading = false
+): QualityBadgeView | undefined {
+  if (loading) return { kind: 'loading', title: '正在探测画质…', retryable: false };
+  if (!entry) return undefined;
+  const label = qualityLabel(entry.height);
+  if (label) {
+    return {
+      kind: 'value',
+      label,
+      title:
+        entry.from === 'play'
+          ? `播放实测的真实分辨率（${entry.height}P）`
+          : `解析播放列表得到的档位（${entry.height}P）`,
+      retryable: false,
+    };
+  }
+  if (entry.error) {
+    const reason = failureReasonLabel(entry.error);
+    // 不用「失败/不可用」这类否定结论：探测失败只代表这次没测到，
+    // 同一个源换个时刻常常能测到（实测也证明了源是可用的）
+    return {
+      kind: 'failed',
+      label: '未测到',
+      reason,
+      title: `本次没测到画质：${entry.error}。${
+        reason === '超时' ? '多半是网络抖动或源站响应慢，点击重试' : '点击可重试，也可以直接播放，播放后会自动记录实测分辨率'
+      }`,
+      retryable: true,
+    };
+  }
+  return {
+    kind: 'unknown',
+    title: '单码率或直链，播放列表里没有画质信息；播放一次后会记录实测分辨率',
+    retryable: false,
+  };
+}
+
+export interface QualitySummary {
+  /** 最高档位标签；没有任何可用高度时为 undefined */
+  best?: string;
+  /** 拿到分辨率的条数（探测或实测） */
+  known: number;
+  /** 探测失败的条数 */
+  failed: number;
+  /** 参与统计的条目总数（含「未知」） */
+  total: number;
+}
+
+/**
+ * 一组来源的画质汇总：卡片收起时给一个「最高 1080P」的结论，
+ * 展开时用 known/total 表达「8 个源里探到 5 个」，比逐个徽章更容易决策。
+ * 传入 undefined 的条目（尚未探测）不计入 total，避免进度分母虚高。
+ */
+export function summarizeQuality(entries: Array<QualityEntry | undefined>): QualitySummary {
+  let bestHeight: number | undefined;
+  let known = 0;
+  let failed = 0;
+  let total = 0;
+  for (const entry of entries) {
+    if (!entry) continue;
+    total += 1;
+    if (entry.height !== undefined && entry.height > 0) {
+      known += 1;
+      if (bestHeight === undefined || entry.height > bestHeight) bestHeight = entry.height;
+    } else if (entry.error) {
+      failed += 1;
+    }
+  }
+  return { best: qualityLabel(bestHeight), known, failed, total };
 }
 
 /**
