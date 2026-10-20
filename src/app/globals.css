@@ -154,3 +154,37 @@ body {
   0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
   50% { opacity: 0.55; box-shadow: 0 0 0 4px rgba(239, 68, 68, 0); }
 }
+
+/*
+ * 播放器控制条在窄屏没有多余横向空间：
+ * 上/下集控件会把右侧的「网页全屏」「全屏」挤出可视区（手机上表现为图标显示不全）。
+ * 只在窄于 640px 时收起这两个控件——手机横屏、平板仍有空间，可以保留。
+ * 切集在任何情况下都还能用播放器下方的按钮。
+ */
+@media (max-width: 640px) {
+  /* 竖屏空间只够放「播放 + 时间 + 设置 + 网页全屏 + 全屏」：
+     音量交给系统按键，截图与画中画在手机上很少用，一并收起，
+     保证最右侧的全屏按钮完整可见 */
+  .art-control-prev-episode,
+  .art-control-next-episode,
+  .art-control-volume,
+  .art-control-screenshot,
+  .art-control-pip {
+    display: none !important;
+  }
+
+  /* 00:04 / 01:26:30 这种长文本占宽最多，缩字号再收紧内边距 */
+  .art-control-time {
+    font-size: 11px;
+    padding: 0 2px;
+  }
+
+  /* 默认每个图标 46px，竖屏下收到 40px —— 省出的宽度正好让最后一个全屏按钮不贴边 */
+  .art-control-playAndPause,
+  .art-control-setting,
+  .art-control-fullscreenWeb,
+  .art-control-fullscreen {
+    width: 40px !important;
+    min-width: 40px !important;
+  }
+}

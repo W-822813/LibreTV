@@ -6,7 +6,7 @@ import { api } from '@/lib/client-api';
 import type { SourceConfig, SearchResultItem } from '@/lib/types';
 import { buildWatchUrl, cn } from '@/lib/utils';
 import { useAppStore, resolveSource } from '@/lib/store';
-import { qualityKey } from '@/lib/quality';
+import { qualityKey, qualityLabel } from '@/lib/quality';
 import { useToast } from './toast';
 import { Icon } from './icon';
 import { SmartImage } from './smart-image';
@@ -26,7 +26,15 @@ interface Candidate {
   ms?: number;
   ok?: boolean;
   episodes?: number;
+  /** 测速失败原因：失败源点开后至少能知道是超时、还是源站直接拒绝 */
+  error?: string;
 }
+
+/** 候选条目的稳定标识：选中态必须绑它，绑数组下标会在测速结果重排后指错源 */
+const candidateKey = (c: Candidate) => `${c.source.key}_${c.result.vodId}`;
+
+const isCurrentCandidate = (c: Candidate, sourceKey: string, vodId: string) =>
+  c.source.key === sourceKey && String(c.result.vodId) === String(vodId);
 
 export function SwitchSourceModal({
   currentTitle,
@@ -48,7 +56,16 @@ export function SwitchSourceModal({
   const [phase, setPhase] = useState<'searching' | 'testing' | 'done'>('searching');
   /** 封面加载失败记录（按卡片 key）；失败后降级为占位图标，避免破图 */
   const [imgFailed, setImgFailed] = useState<Record<string, boolean>>({});
+  /** 当前选中的候选：存稳定 key 而不是下标，测速重排后仍然指向同一个源 */
+  const [selectedKey, setSelectedKey] = useState('');
+  /** 正在单独重测的候选 key：失败源给一次重试机会，失败原因不能只是死路 */
+  const [retestingKey, setRetestingKey] = useState('');
+  /** 重测的在途请求：换片重搜/关闭面板时中止，避免卸载后 setState */
+  const retestAbortRef = useRef<AbortController | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const tabBarRef = useRef<HTMLDivElement>(null);
+  /** Tab 栏左右是否还有内容：没有渐隐提示，用户不知道右边还藏着源 */
+  const [tabEdges, setTabEdges] = useState({ left: false, right: false });
 
   // 打开时把焦点移入弹窗、Tab 圈闭在弹窗内、关闭后归还焦点
   useFocusTrap(true, panelRef);
@@ -116,6 +133,7 @@ export function SwitchSourceModal({
             c.ok = r.ok;
             c.ms = r.ms;
             c.episodes = r.detail?.episodes.length ?? 0;
+            c.error = r.ok ? undefined : r.error;
           })
         );
         if (cancelled) return;
@@ -134,6 +152,8 @@ export function SwitchSourceModal({
     return () => {
       cancelled = true;
       controller.abort();
+      // 换片重搜 / 关闭面板时，单独发起的重测也要跟着停
+      retestAbortRef.current?.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentTitle, store.yellowFilter]);
@@ -148,14 +168,77 @@ export function SwitchSourceModal({
     if (targets.length > 0) probe(targets);
   }, [phase, candidates, probe]);
 
-  const sorted = [...candidates].sort((a, b) => {
-    const aCurrent = a.source.key === currentSourceKey && String(a.result.vodId) === String(currentVodId);
-    const bCurrent = b.source.key === currentSourceKey && String(b.result.vodId) === String(currentVodId);
+  const sorted = useMemo(() => [...candidates].sort((a, b) => {
+    const aCurrent = isCurrentCandidate(a, currentSourceKey, currentVodId);
+    const bCurrent = isCurrentCandidate(b, currentSourceKey, currentVodId);
     if (aCurrent !== bCurrent) return aCurrent ? -1 : 1;
     const msA = a.ok ? a.ms ?? 99_999 : 99_999;
     const msB = b.ok ? b.ms ?? 99_999 : 99_999;
     return msA - msB;
-  });
+  }), [candidates, currentSourceKey, currentVodId]);
+
+  /**
+   * 面板展示的源：优先用户点过的那个；还没点过时先落到「第一个可切换的源」——
+   * 打开面板的目的就是换源，默认停在「当前播放中」等于让用户多点一次。
+   */
+  const selected =
+    sorted.find((c) => candidateKey(c) === selectedKey) ??
+    sorted.find((c) => !isCurrentCandidate(c, currentSourceKey, currentVodId) && c.ok) ??
+    sorted[0];
+  const selectedCandidateKey = selected ? candidateKey(selected) : '';
+
+  useEffect(() => {
+    const el = tabBarRef.current;
+    if (!el) return;
+    const update = () =>
+      setTabEdges({
+        left: el.scrollLeft > 4,
+        right: el.scrollLeft + el.clientWidth < el.scrollWidth - 4,
+      });
+    update();
+    el.addEventListener('scroll', update, { passive: true });
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener('scroll', update);
+      ro.disconnect();
+    };
+  }, [sorted.length]);
+
+  // 默认选中项常落在可视区外：滚进视野，否则高亮等于不存在
+  useEffect(() => {
+    const bar = tabBarRef.current;
+    if (!bar) return;
+    const active = bar.querySelector<HTMLElement>('[data-active="true"]');
+    if (!active) return;
+    bar.scrollTo({ left: active.offsetLeft - (bar.clientWidth - active.clientWidth) / 2, behavior: 'smooth' });
+  }, [selectedCandidateKey]);
+
+  const retest = async (c: Candidate) => {
+    const key = candidateKey(c);
+    setRetestingKey(key);
+    retestAbortRef.current?.abort();
+    const controller = new AbortController();
+    retestAbortRef.current = controller;
+    try {
+      const r = await api.detailSpeed(c.result.vodId, c.source, controller.signal);
+      if (controller.signal.aborted) return;
+      setCandidates((prev) =>
+        prev.map((x) =>
+          candidateKey(x) === key
+            ? { ...x, ok: r.ok, ms: r.ms, episodes: r.detail?.episodes.length ?? 0, error: r.ok ? undefined : r.error }
+            : x
+        )
+      );
+      // 重测成功说明源只是刚才抖了一下：强制补一次画质，否则会撞上失败冷却（2 分钟内不再探）
+      if (r.ok) retry([c.result]);
+    } finally {
+      if (retestAbortRef.current === controller) {
+        retestAbortRef.current = null;
+        setRetestingKey('');
+      }
+    }
+  };
 
   const switchTo = (c: Candidate) => {
     if (!c.episodes) {
@@ -178,7 +261,7 @@ export function SwitchSourceModal({
 
   return (
     <div
-      className="fixed inset-0 z-[65] flex items-start justify-center overflow-y-auto bg-black/80 py-10 px-4 animate-fade-in"
+      className="fixed inset-0 z-[65] flex items-end sm:items-center justify-center bg-black/80 sm:py-10 sm:px-4 animate-fade-in"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -186,12 +269,14 @@ export function SwitchSourceModal({
       <div
         ref={panelRef}
         tabIndex={-1}
-        className="bg-surface-raised rounded-xl w-full max-w-3xl shadow-2xl p-5 animate-slide-up outline-none"
+        className="bg-surface-raised rounded-t-2xl sm:rounded-xl w-full max-w-3xl shadow-2xl p-5 pb-[calc(1.25rem_+_env(safe-area-inset-bottom))] sm:pb-5 max-h-[92vh] sm:max-h-[85vh] flex flex-col overflow-hidden animate-slide-up outline-none"
         role="dialog"
         aria-modal="true"
         aria-label={`换源：${currentTitle}`}
       >
-        <div className="flex items-center justify-between mb-4">
+        <div className="sm:hidden mx-auto mb-3 h-1 w-10 shrink-0 rounded-full bg-line" aria-hidden />
+        {/* 标题固定在滚动区之外：比 sticky 更省事，也不会有背景覆盖不到 padding 的缝隙 */}
+        <div className="shrink-0 mb-4 flex items-center justify-between">
           <div className="min-w-0">
             <h2 className="text-lg font-semibold text-content truncate" title={currentTitle}>
               {currentTitle}
@@ -221,81 +306,157 @@ export function SwitchSourceModal({
           </button>
         </div>
 
+        {/* 内容区独占剩余高度并自己滚动：标题与拖拽条始终可见，不随内容滚走 */}
+        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden scrollbar-thin">
         {phase !== 'done' ? (
           <LoadingState label={phase === 'searching' ? '搜索各资源中...' : '测速中...'} />
         ) : sorted.length === 0 ? (
           <EmptyState variant="plain" title="其他点播源未找到同名资源" />
         ) : (
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            {sorted.map((c) => {
-              const isCurrent = c.source.key === currentSourceKey && String(c.result.vodId) === String(currentVodId);
-              const cardKey = `${c.source.key}_${c.result.vodId}`;
-              const img = c.result.pic;
-              const coverFailed = imgFailed[cardKey] ?? false;
+          <>
+            {/* 横向 Tab：源多时比网格省纵向空间，手机上可直接滑动 */}
+            <div className="relative">
+              <div
+                ref={tabBarRef}
+                className="flex gap-1.5 overflow-x-auto pb-1 scrollbar-thin"
+                role="tablist"
+                aria-label="选择播放源"
+              >
+                {sorted.map((c) => {
+                  const isCurrent = isCurrentCandidate(c, currentSourceKey, currentVodId);
+                  const key = candidateKey(c);
+                  const active = selected === c;
+                  const qLabel = qualityLabel(qualities[qualityKey(c.source.key, c.result.vodId)]?.height);
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      role="tab"
+                      data-active={active}
+                      aria-selected={active}
+                      className={cn(
+                        'shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs border transition-colors',
+                        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50',
+                        active ? 'border-accent bg-accent/10 text-accent' : 'border-line bg-chip text-muted hover:bg-hover'
+                      )}
+                      onClick={() => setSelectedKey(key)}
+                    >
+                      <span className="max-w-[8rem] truncate font-medium">{c.source.name}</span>
+                      {isCurrent && <span className="text-[10px] opacity-80">当前</span>}
+                      {qLabel && <span className="text-[10px] tabular-nums opacity-70">{qLabel}</span>}
+                      {c.ok ? (
+                        <span
+                          className={cn(
+                            'w-1.5 h-1.5 rounded-full shrink-0',
+                            (c.ms ?? 0) > 2000 ? 'bg-warning-solid' : 'bg-success-solid'
+                          )}
+                          title={`${c.ms}ms`}
+                        />
+                      ) : (
+                        <span className="text-[10px] text-danger">失败</span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+              {/* 左右渐隐：提示这一栏还能横向滑 */}
+              {tabEdges.left && (
+                <div className="pointer-events-none absolute inset-y-0 left-0 w-6 bg-gradient-to-r from-surface-raised to-transparent" />
+              )}
+              {tabEdges.right && (
+                <div className="pointer-events-none absolute inset-y-0 right-0 w-6 bg-gradient-to-l from-surface-raised to-transparent" />
+              )}
+            </div>
+
+            {/* 选中源详情：封面降到缩略图，只留速度/集数两项真正要比的数据 */}
+            {selected && (() => {
+              const c = selected;
+              const isCurrent = isCurrentCandidate(c, currentSourceKey, currentVodId);
+              const key = candidateKey(c);
+              const coverFailed = imgFailed[key] ?? false;
+              const qKey = qualityKey(c.source.key, c.result.vodId);
               return (
-                <div
-                  key={`${c.source.key}_${c.result.vodId}`}
-                  role="button"
-                  tabIndex={isCurrent ? -1 : 0}
-                  aria-disabled={isCurrent}
-                  className={cn(
-                    'text-left group relative rounded-lg overflow-hidden bg-card transition-transform',
-                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50',
-                    !isCurrent && 'hover:scale-[1.03] cursor-pointer',
-                    isCurrent && 'cursor-default'
-                  )}
-                  onClick={() => !isCurrent && switchTo(c)}
-                  onKeyDown={(e) => {
-                    if (e.key !== 'Enter' && e.key !== ' ') return;
-                    e.preventDefault();
-                    if (!isCurrent) switchTo(c);
-                  }}
-                >
-                  <div className="relative aspect-[2/3] bg-chip">
-                    {img && !coverFailed ? (
+                <div className="mt-3 flex items-start gap-3 p-3 bg-card rounded-lg">
+                  <div className="shrink-0 w-20 aspect-[2/3] rounded-md overflow-hidden bg-chip">
+                    {c.result.pic && !coverFailed ? (
                       <SmartImage
                         url={c.result.pic}
                         mode={store.imageProxyMode}
                         customProxy={store.customImageProxy}
                         alt={c.result.name}
                         className="w-full h-full object-cover"
-                        onExhausted={() => setImgFailed((prev) => ({ ...prev, [cardKey]: true }))}
+                        onExhausted={() => setImgFailed((prev) => ({ ...prev, [key]: true }))}
                       />
                     ) : (
                       <div className="w-full h-full flex items-center justify-center text-faint">
-                        <Icon name="link" className="w-6 h-6" />
+                        <Icon name="link" className="w-5 h-5" />
                       </div>
                     )}
-                    <span
-                      className={cn(
-                        'absolute top-1.5 right-1.5 tag',
-                        !c.ok ? 'bg-danger-solid/85 text-white' : c.ms! > 2000 ? 'bg-warning-solid/85 text-white' : 'bg-success-solid/85 text-white'
-                      )}
-                    >
-                      {!c.ok ? '失败' : `${c.ms}ms`}
-                    </span>
-                    {isCurrent && (
-                      <span className="absolute inset-x-0 bottom-0 bg-accent/90 text-on-accent text-xs text-center py-1">当前播放</span>
-                    )}
                   </div>
-                  <div className="p-2">
-                    <div className="text-xs font-medium text-content truncate" title={c.source.name}>
-                      {c.source.name}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <h3 className="text-sm font-semibold text-content truncate" title={c.source.name}>
+                        {c.source.name}
+                      </h3>
+                      <QualityBadge entry={qualities[qKey]} loading={probing[qKey]} onRetry={() => retry([c.result])} />
+                      {isCurrent && (
+                        <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-accent/15 text-accent">播放中</span>
+                      )}
                     </div>
-                    <div className="flex items-center justify-between gap-1 mt-0.5">
-                      <span className="text-xs text-faint">{c.episodes ? `${c.episodes} 集` : '无资源'}</span>
-                      <QualityBadge
-                        entry={qualities[qualityKey(c.source.key, c.result.vodId)]}
-                        loading={probing[qualityKey(c.source.key, c.result.vodId)]}
-                        onRetry={() => retry([c.result])}
-                      />
+                    <div className="mt-2 grid grid-cols-2 gap-2 sm:max-w-[16rem]">
+                      <div className="rounded-md bg-chip px-2 py-1.5">
+                        <div className="text-[10px] text-faint">速度</div>
+                        <div
+                          className={cn(
+                            'text-xs font-medium tabular-nums',
+                            !c.ok ? 'text-danger' : (c.ms ?? 0) > 2000 ? 'text-warning' : 'text-success'
+                          )}
+                        >
+                          {c.ok ? `${c.ms}ms` : '不可用'}
+                        </div>
+                      </div>
+                      <div className="rounded-md bg-chip px-2 py-1.5">
+                        <div className="text-[10px] text-faint">集数</div>
+                        <div className="text-xs font-medium text-content">
+                          {c.episodes ? `${c.episodes} 集` : '无资源'}
+                        </div>
+                      </div>
                     </div>
+                    <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                      {isCurrent ? (
+                        <span className="text-xs text-accent">当前正在播放</span>
+                      ) : (
+                        <>
+                          <button type="button" className="btn-primary btn-sm" disabled={!c.episodes} onClick={() => switchTo(c)}>
+                            切换到此源
+                          </button>
+                          {/* 测速失败但拿得到集数：允许点。详情接口偶发超时很常见，别把能播的源挡在外面 */}
+                          {!c.ok && !!c.episodes && <span className="text-xs text-warning">测速未通过，仍可尝试</span>}
+                        </>
+                      )}
+                      {!c.ok && (
+                        <button
+                          type="button"
+                          className="btn-ghost btn-sm"
+                          disabled={retestingKey === key}
+                          onClick={() => void retest(c)}
+                        >
+                          {retestingKey === key ? '重测中...' : '重新测速'}
+                        </button>
+                      )}
+                    </div>
+                    {!c.ok && c.error && (
+                      <p className="mt-1 text-[11px] text-faint line-clamp-1" title={c.error}>
+                        {c.error}
+                      </p>
+                    )}
                   </div>
                 </div>
               );
-            })}
-          </div>
+            })()}
+          </>
         )}
+        </div>
       </div>
     </div>
   );

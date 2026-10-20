@@ -249,6 +249,10 @@ function WatchContent() {
                   onTimeUpdate={handleProgress}
                   onPause={handleProgress}
                   onEnded={handleEnded}
+                  hasPrevEpisode={currentIndex > 0}
+                  hasNextEpisode={episodes.length > 0 && currentIndex < episodes.length - 1}
+                  onPrevEpisode={() => goEpisode(currentIndex - 1)}
+                  onNextEpisode={() => goEpisode(currentIndex + 1)}
                   onQuality={(height) => {
                     // 播放实测是最权威的画质来源，回写后搜索列表里该「源 + 影片」直接显示
                     if (!sourceKey || !vodId) return;

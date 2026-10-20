@@ -176,33 +176,110 @@ export function normalizeTitle(s: string): string {
 }
 
 /**
- * 相关性判断：结果标题是否真的命中了搜索词。
- * 部分采集站会做分词/OR 模糊搜索（搜「摔跤吧！爸爸」返回一堆「爸爸XXX」），
- * 逐条校验后只保留真正相关的结果。
+ * 仅将独立数字或明确的「第 N 季」后缀作为季数别名。
  *
- * 规则：归一化后的标题包含归一化后的完整关键词；
- * 多词查询（空格分隔）时放宽为「每个词都命中」即可（如「钢铁侠 2008」）。
+ * `bareNeedsSpace` 区分两侧：
+ * - 查询侧传 false：用户习惯直接输入「庆余年2」，数字前没有空格也得认成季数
+ * - 标题侧保持 true：必须有空格，避免把片名自带的数字（「电影2」）误判成第二季
  */
-export function isRelevant(name: string, wd: string): boolean {
-  const nName = normalizeTitle(name);
-  const nWd = normalizeTitle(wd);
-  if (!nName || !nWd) return true; // 空关键词不参与过滤
-  if (nName.includes(nWd)) return true;
-  const tokens = wd.trim().split(/\s+/);
-  if (tokens.length > 1) {
-    return tokens.every((t) => {
-      const n = normalizeTitle(t);
-      return n && nName.includes(n);
-    });
+function parseSeasonSuffix(
+  title: string,
+  allowAnnotations = false,
+  bareNeedsSpace = true
+): { base: string; season: number; explicit: boolean } | undefined {
+  // 标题侧允许「第二季」后跟任意附注：粤语、预告片、【影视解说】、无分隔符的「第二季粤语」都算
+  const explicitPattern = allowAnnotations
+    ? /^(.*?)\s*第\s*([1-9]\d?|[一二两三四五六七八九十]{1,3})\s*季.*$/u
+    : /^(.*?)\s*第\s*([1-9]\d?|[一二两三四五六七八九十]{1,3})\s*季$/u;
+  const explicit = title.trim().match(explicitPattern);
+  const bare = title.trim().match(bareNeedsSpace ? /^(.*?)\s+([1-9]\d?)$/u : /^(.*?)\s*([1-9]\d?)$/u);
+  const match = explicit ?? bare;
+  if (!match || !normalizeTitle(match[1])) return undefined;
+  const value = match[2];
+  const digits = '零一二三四五六七八九';
+  let season = Number(value);
+  if (!Number.isFinite(season)) {
+    const chinese = value.replace('两', '二');
+    if (/^[一二三四五六七八九]$/u.test(chinese)) {
+      season = digits.indexOf(chinese);
+    } else if (/^[一二三四五六七八九]?十[一二三四五六七八九]?$/u.test(chinese)) {
+      const [tens, units] = chinese.split('十');
+      season = (tens ? digits.indexOf(tens) : 1) * 10 + (units ? digits.indexOf(units) : 0);
+    }
+  }
+  if (!Number.isFinite(season)) return undefined;
+  return { base: match[1], season, explicit: Boolean(explicit) };
+}
+
+/** 数字必须完整命中，避免第 2 季误匹配 12 或 20。 */
+function includesKeyword(title: string, keyword: string): boolean {
+  if (!title || !keyword) return false;
+  let index = title.indexOf(keyword);
+  while (index >= 0) {
+    const before = title[index - 1] ?? '';
+    const after = title[index + keyword.length] ?? '';
+    if ((!/^\d/u.test(keyword) || !/\d/u.test(before)) &&
+        (!/\d$/u.test(keyword) || !/\d/u.test(after))) return true;
+    index = title.indexOf(keyword, index + 1);
   }
   return false;
 }
 
 /**
- * 结果相关性过滤：丢弃与关键词无关的条目。
- * 过滤后为空时回退到原列表——宁可多展示也不把源站唯一可用的结果清空。
+ * 关键词只解析一次。
+ * filterRelevantResults 会对同一个查询过滤几百上千条结果，
+ * 关键词的归一化、季数解析、分词结果对每条都相同，没必要重复算。
  */
+interface PreparedQuery {
+  normalized: string;
+  season?: { base: string; season: number; explicit: boolean };
+  tokens: string[];
+}
+
+function prepareQuery(wd: string): PreparedQuery | undefined {
+  const normalized = normalizeTitle(wd);
+  if (!normalized) return undefined;
+  return {
+    normalized,
+    // 查询侧允许「庆余年2」这种无空格写法
+    season: parseSeasonSuffix(wd, false, false),
+    tokens: wd.trim().split(/\s+/).map(normalizeTitle).filter(Boolean),
+  };
+}
+
+function matchesPrepared(nName: string, query: PreparedQuery): boolean {
+  if (includesKeyword(nName, query.normalized)) return true;
+  return query.tokens.length > 1 && query.tokens.every((token) => includesKeyword(nName, token));
+}
+
+function isRelevantPrepared(name: string, query: PreparedQuery): boolean {
+  const nName = normalizeTitle(name);
+  if (!nName) return false;
+  const titleSeason = parseSeasonSuffix(name, true);
+  if (query.season && titleSeason) {
+    if (query.season.season !== titleSeason.season) return false;
+    if (query.season.explicit || titleSeason.explicit) {
+      const baseQuery = prepareQuery(query.season.base);
+      if (baseQuery) return matchesPrepared(normalizeTitle(titleSeason.base), baseQuery);
+    }
+  }
+  return matchesPrepared(nName, query);
+}
+
+/**
+ * 忽略标点和大小写，多词查询要求每个词都命中。
+ * 独立的末尾数字也可匹配明确的中文季数后缀；
+ * 标题内部的数字与四位年份不作为季数别名。
+ */
+export function isRelevant(name: string, wd: string): boolean {
+  const query = prepareQuery(wd);
+  if (!query) return true;
+  return isRelevantPrepared(name, query);
+}
+
+/** 丢弃无关结果；即使全部不相关，也不能返回源站的原始目录。 */
 export function filterRelevantResults<T extends { name?: string }>(items: T[], wd: string): T[] {
-  const filtered = items.filter((item) => isRelevant(item.name || '', wd));
-  return filtered.length > 0 ? filtered : items;
+  const query = prepareQuery(wd);
+  if (!query) return items;
+  return items.filter((item) => isRelevantPrepared(item.name || '', query));
 }

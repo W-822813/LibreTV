@@ -249,7 +249,9 @@ export async function POST(req: Request) {
         sources.map(async (source, i) => {
           const outcome = await searchSource(source, wd);
           outcomes[i] = outcome;
-          send({ type: 'source', ...outcome });
+          // 中间结果与最终结果共用去重和过滤规则，避免无关/成人条目短暂出现在页面上。
+          const { list } = aggregateOutcomes([outcome], wd, filterAdult);
+          send({ type: 'source', ...outcome, list });
         })
       );
 
