@@ -14,10 +14,23 @@ import { loadCacheSettings } from '@/lib/video-cache';
 import { formatTime } from '@/lib/utils';
 import { prefersTouchPointer } from '@/lib/touch-pointer';
 import {
+  findActiveSegment,
+  findCrossedEnding,
+  resolveSegments,
+  SEGMENT_COLORS,
+  SEGMENT_LABELS,
+  type ResolvedSegment,
+  type SkipMark,
+  type SkipSegment,
+} from '@/lib/skip-marks';
+import {
   ART_DEFAULT_CONTROL_HIDE_MS,
   DESKTOP_CONTROL_HIDE_MS,
   TOUCH_CONTROL_HIDE_MS,
 } from '@/lib/control-hide';
+
+/** 片段时间统一保留 1 位小数：与面板展示保持一致，避免浮点尾巴 */
+const round1 = (v: number) => Math.round(v * 10) / 10;
 
 /**
  * 播放器外壳：ArtPlayer + hls.js（旧版 player.js 的 React 化）。
@@ -29,11 +42,38 @@ import {
  * 重建 <video> 元素，触发「黑屏有声」的渲染竞态。
  */
 
+/** 暴露给播放页的读取接口：「记录当前」需要比 5s 节流进度回调更精确的位置 */
+export interface PlayerSkipApi {
+  getCurrentTime(): number;
+  getDuration(): number;
+  /** 跳转到指定位置（「试跳」/标记片段起点用） */
+  seek(seconds: number): void;
+  /** 暂停播放：记录标记前先定格，避免点击到读取之间视频继续走 */
+  pause(): void;
+  /** 当前是否处于暂停状态 */
+  isPaused(): boolean;
+}
+
 interface PlayerShellProps {
   url: string;
   title: string;
   adFilter: boolean;
   autoplayNext: boolean;
+  /** 当前剧的跳过片段标记（父级按归一化剧名查好后传入，换集/换源不变） */
+  skipMark?: SkipMark;
+  /**
+   * 自动跳过标记的片段：片头/中段跳到片段末尾，片尾（连续播放越过起点）结束本集。
+   * 是否连播下一集仍由 autoplayNext 决定。
+   */
+  autoSkipSegments: boolean;
+  /** 中段两步态的起点：由页面层持有，面板与快捷键共用同一份状态 */
+  pendingStart: number | null;
+  /** 更新中段起点；null 表示取消或已消费 */
+  onPendingStart: (start: number | null) => void;
+  /** 播放器创建/销毁时回调，供播放页读取精确播放位置 */
+  onPlayerApi?: (api: PlayerSkipApi | null) => void;
+  /** 快捷键（Shift+I/O/S/E）记录片段时回调，由父级做校验与写入 */
+  onRecordSegment?: (segment: SkipSegment) => void;
   /** 剧集标识 `${source}:${vodId}:${episodeIndex}`（片段缓存按集淘汰的分组键） */
   episodeKey?: string;
   /** 下一集 m3u8 地址：当前集预取完成后预热下一集前 7 分钟 */
@@ -64,6 +104,12 @@ export function PlayerShell({
   title,
   adFilter,
   autoplayNext,
+  skipMark,
+  autoSkipSegments,
+  pendingStart,
+  onPendingStart,
+  onPlayerApi,
+  onRecordSegment,
   episodeKey,
   nextUrl,
   nextEpisodeKey,
@@ -90,12 +136,16 @@ export function PlayerShell({
 
   // 始终持有最新 props/回调，避免重建播放器
   const propsRef = useRef({
-    url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey,
+    url, title, adFilter, autoplayNext, skipMark, autoSkipSegments,
+    pendingStart, onPendingStart, onPlayerApi, onRecordSegment,
+    episodeKey, nextUrl, nextEpisodeKey,
     getRestorePosition, onTimeUpdate, onEnded, onPause, onQuality, onRequestSwitchSource,
     onPrevEpisode, onNextEpisode, hasPrevEpisode, hasNextEpisode,
   });
   propsRef.current = {
-    url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey,
+    url, title, adFilter, autoplayNext, skipMark, autoSkipSegments,
+    pendingStart, onPendingStart, onPlayerApi, onRecordSegment,
+    episodeKey, nextUrl, nextEpisodeKey,
     getRestorePosition, onTimeUpdate, onEnded, onPause, onQuality, onRequestSwitchSource,
     onPrevEpisode, onNextEpisode, hasPrevEpisode, hasNextEpisode,
   };
@@ -124,6 +174,18 @@ export function PlayerShell({
   const recoveryRef = useRef<PlaybackRecovery | null>(null);
   // 自然播完标记，卸载时不回写进度（避免覆盖「已看完」记录）
   const endedRef = useRef(false);
+  // 跳过片段：每集已处理的片段（按 type:start 去重），换集时重置（见 loadEpisode）
+  const handledSegmentsRef = useRef<Set<string>>(new Set());
+  // 被「撤销」过的片段：本集不再自动跳（否则撤回到片段内会被立刻再跳走），但仍保留提示按钮
+  const suppressedAutoRef = useRef<Set<string>>(new Set());
+  // 上一次 timeupdate 的位置：用于区分「连续播放越过片尾」与「拖动进度条」
+  const lastSampleRef = useRef(0);
+  // 跳过按钮提示；用 ref 比较，避免 timeupdate 每 250ms 触发重渲染
+  const [skipPrompt, setSkipPrompt] = useState<ResolvedSegment | null>(null);
+  const skipPromptRef = useRef<ResolvedSegment | null>(null);
+  // 刚跳过的片段：给一个撤销窗口，误标导致跳掉正片时不必手动拖回去
+  const [undoSkip, setUndoSkip] = useState<{ from: number; segment: ResolvedSegment } | null>(null);
+  const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const showHint = (text: string) => {
     setHint(text);
@@ -177,6 +239,104 @@ export function PlayerShell({
         }
       },
     });
+  };
+
+  /** 切换提示状态；值相同直接返回，避免 timeupdate 高频 setState */
+  const updateSkipPrompt = (next: ResolvedSegment | null) => {
+    const prev = skipPromptRef.current;
+    const same =
+      prev === next ||
+      (prev !== null &&
+        next !== null &&
+        prev.type === next.type &&
+        prev.start === next.start &&
+        prev.end === next.end);
+    if (same) return;
+    skipPromptRef.current = next;
+    setSkipPrompt(next);
+  };
+
+  /** 片段去重键：按类型 + 起点，同一集内每段只处理一次 */
+  const segmentKey = (s: ResolvedSegment) => `${s.type}:${s.start}`;
+
+  /** 进度条区间可视化：在进度条轨道叠加半透明色带（颜色与面板图例共用 SEGMENT_COLORS） */
+  const renderSkipMarks = () => {
+    const art = artRef.current;
+    const progress = art?.template.$progress;
+    if (!progress) return;
+    progress.querySelectorAll('[data-skip-segment]').forEach((el: Element) => el.remove());
+    const duration = art.duration;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    const segments = resolveSegments(propsRef.current.skipMark, duration);
+    for (const seg of segments) {
+      const el = document.createElement('div');
+      el.dataset.skipSegment = '1';
+      el.title = `跳过${SEGMENT_LABELS[seg.type]}`;
+      const left = (seg.start / duration) * 100;
+      const width = Math.max(0.4, ((seg.end - seg.start) / duration) * 100);
+      el.style.cssText = `position:absolute;left:${left}%;width:${width}%;top:0;bottom:0;background:${SEGMENT_COLORS[seg.type]};pointer-events:none;`;
+      progress.appendChild(el);
+    }
+  };
+
+  /**
+   * 跳到片段末尾并续跑预取；同步 lastSampleRef，避免下一拍被误判为「连续越过片尾」。
+   * 返回是否成功：媒体未就绪导致赋值失败时返回 false，调用方不置已处理标记，
+   * 下一次 timeupdate 会重新判定（保证「可重试」）。
+   */
+  const skipTo = (seconds: number): boolean => {
+    const art = artRef.current;
+    if (!art || !Number.isFinite(seconds) || seconds < 0) return false;
+    try {
+      art.currentTime = seconds;
+    } catch {
+      return false;
+    }
+    lastSampleRef.current = seconds;
+    ensurePrefetch(currentMediaUrlRef.current, seconds);
+    return true;
+  };
+
+  /** 记录一次跳过（跳转前的位置）：给 12s 撤销窗口，误标导致跳掉正片时不用手动拖回去 */
+  const rememberSkip = (from: number, segment: ResolvedSegment) => {
+    setUndoSkip({ from, segment });
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    undoTimerRef.current = setTimeout(() => setUndoSkip(null), 12_000);
+  };
+
+  const undoLastSkip = () => {
+    const last = undoSkip;
+    if (!last) return;
+    if (undoTimerRef.current) {
+      clearTimeout(undoTimerRef.current);
+      undoTimerRef.current = null;
+    }
+    // 撤销后把片段从「已处理」移除（按钮会重新出现），同时本集不再自动跳它：
+    // 否则回到片段内会被下一次 timeupdate 立刻再跳走，形成"撤销→又被跳过"的死循环
+    handledSegmentsRef.current.delete(segmentKey(last.segment));
+    suppressedAutoRef.current.add(segmentKey(last.segment));
+    skipTo(last.from);
+    setUndoSkip(null);
+    showHint('已撤回跳过');
+  };
+
+  /**
+   * 跳过片尾：与自然播完共用 onEnded 链路（清进度 + 依 autoplayNext 连播下一集）。
+   * endedRef 置 true 同时阻止 video:ended 重复回调，也避免卸载时把片尾进度回写。
+   */
+  const finishBySkip = (ending?: ResolvedSegment) => {
+    const art = artRef.current;
+    if (ending) handledSegmentsRef.current.add(segmentKey(ending));
+    endedRef.current = true;
+    updateSkipPrompt(null);
+    setUndoSkip(null);
+    try {
+      art?.pause();
+    } catch {
+      /* 忽略 */
+    }
+    showHint('已跳过片尾');
+    propsRef.current.onEnded?.();
   };
 
   /**
@@ -310,6 +470,13 @@ export function PlayerShell({
     videoErrorRetryUsedRef.current = false;
     restoredRef.current = false;
     lastPrefetchEnsureRef.current = 0;
+    // 跳过片段按集重置：上一集已处理过不意味新一集也处理过
+    handledSegmentsRef.current.clear();
+    suppressedAutoRef.current.clear();
+    lastSampleRef.current = 0;
+    endedRef.current = false;
+    updateSkipPrompt(null);
+    setUndoSkip(null);
     recoveryRef.current = new PlaybackRecovery();
     // 换集时清掉上一集的预取窗口，避免带宽被旧集占用
     getVideoPrefetcher().stop();
@@ -337,6 +504,9 @@ export function PlayerShell({
     restoredRef.current = false;
     recoveryRef.current = new PlaybackRecovery();
     endedRef.current = false;
+    handledSegmentsRef.current.clear();
+    suppressedAutoRef.current.clear();
+    lastSampleRef.current = 0;
 
     let lastSave = 0;
 
@@ -393,6 +563,42 @@ export function PlayerShell({
       },
     });
     artRef.current = art;
+
+    // 进度条区间可视化：初始渲染一次，换集 duration 变化时重绘
+    renderSkipMarks();
+    art.on('video:durationchange', renderSkipMarks);
+    // 全屏切换 / 播放器尺寸变化会重建控件，色带随之被清掉，这里补一次重绘
+    art.on('fullscreen', renderSkipMarks);
+    art.on('fullscreenWeb', renderSkipMarks);
+    art.on('resize', renderSkipMarks);
+
+    // 播放页「记录当前」需要精确时间：不能依赖 5s 节流的 onTimeUpdate
+    propsRef.current.onPlayerApi?.({
+      getCurrentTime: () => {
+        const current = artRef.current?.currentTime;
+        return typeof current === 'number' && Number.isFinite(current) ? current : 0;
+      },
+      getDuration: () => {
+        const duration = artRef.current?.duration;
+        return typeof duration === 'number' && Number.isFinite(duration) ? duration : 0;
+      },
+      seek: (seconds) => {
+        if (!Number.isFinite(seconds) || seconds < 0) return;
+        try {
+          artRef.current.currentTime = seconds;
+        } catch {
+          /* 忽略 */
+        }
+      },
+      pause: () => {
+        try {
+          artRef.current?.pause();
+        } catch {
+          /* 忽略 */
+        }
+      },
+      isPaused: () => artRef.current?.video?.paused ?? true,
+    });
 
     /**
      * 读解码后的真实分辨率。
@@ -451,12 +657,70 @@ export function PlayerShell({
         // loader 读取的 key 不一致，缓存永不命中且直连 fetch 白耗流量
         ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
       }
+
+      // —— 跳过片段判定 ——
+      const p = propsRef.current;
+      const current = art.currentTime;
+      const duration = art.duration;
+      const previous = lastSampleRef.current;
+      lastSampleRef.current = current;
+      const segments = resolveSegments(p.skipMark, duration);
+
+      // 结尾片段：只认连续播放越过起点；拖动进度条、刚写入标记、进度恢复造成的大跳变
+      // 都不自动结束，只显示按钮由用户决定。是否结束由合并后的 autoSkipSegments 控制
+      // （片头/中段跳段，片尾结束本集，是否连播下一集仍看 autoplayNext）。
+      if (
+        p.autoSkipSegments &&
+        restoredRef.current &&
+        playbackStartedRef.current &&
+        findCrossedEnding(segments, previous, current)
+      ) {
+        const ending = segments.find(
+          (s) => s.type === 'ending' && previous < s.start && current >= s.start
+        );
+        finishBySkip(ending);
+        return;
+      }
+
+      // 片头/中段片段：命中则自动跳到末尾（同一类操作，共用 autoSkipSegments 开关）；
+      // 已处理过的片段本集不再反复拉扯。
+      const active = findActiveSegment(segments, current);
+      if (
+        active &&
+        active.type !== 'ending' &&
+        p.autoSkipSegments &&
+        !handledSegmentsRef.current.has(segmentKey(active)) &&
+        !suppressedAutoRef.current.has(segmentKey(active)) &&
+        restoredRef.current &&
+        playbackStartedRef.current
+      ) {
+        if (skipTo(active.end)) {
+          handledSegmentsRef.current.add(segmentKey(active));
+          rememberSkip(current, active);
+          showHint(active.type === 'opening' ? '已跳过片头' : '已跳过中段');
+        }
+      }
+
+      // 按钮提示：当前落在某个未处理片段内（结尾片段显示「跳过片尾」）
+      const prompt =
+        active && !handledSegmentsRef.current.has(segmentKey(active)) ? active : null;
+      updateSkipPrompt(prompt);
     });
     art.on('video:seeked', () => {
       ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
+      // seek 是用户主动行为：拉平采样基准，避免下一拍被误判为「连续越过片尾」。
+      // 暂停中 seek 不会触发 timeupdate，这里也同步刷新按钮的显隐。
+      const current = art.currentTime;
+      lastSampleRef.current = current;
+      const segments = resolveSegments(propsRef.current.skipMark, art.duration);
+      const active = findActiveSegment(segments, current);
+      const prompt =
+        active && !handledSegmentsRef.current.has(segmentKey(active)) ? active : null;
+      updateSkipPrompt(prompt);
     });
     art.on('video:pause', () => {
-      propsRef.current.onPause?.(art.currentTime, art.duration);
+      // 跳过片尾会主动 pause：此时已按「看完」处理，不能再把片尾位置写回进度
+      if (!endedRef.current) propsRef.current.onPause?.(art.currentTime, art.duration);
       // 暂停 = 预取黄金窗口：解除限速并无限铺满整集（用户主动行为，带宽占用可接受）
       // waiting 触发的限速在此解除，否则黄金窗口会被 500ms 轮询冻结
       getVideoPrefetcher().setThrottled(false);
@@ -470,7 +734,10 @@ export function PlayerShell({
       getVideoPrefetcher().setThrottled(false);
     });
     art.on('video:ended', () => {
+      // finishBySkip 已经手动走过结束链路：这里不能重复触发 onEnded
+      if (endedRef.current) return;
       endedRef.current = true;
+      updateSkipPrompt(null);
       propsRef.current.onEnded?.();
     });
 
@@ -502,6 +769,45 @@ export function PlayerShell({
         case 'f': case 'F':
           current.fullscreen = !current.fullscreen; e.preventDefault();
           break;
+        // 标记类快捷键一律要求 Shift：这几键会直接写盘并影响整部剧，
+        // 单键太容易误触（误记片头 = 之后每集都被跳过一大段）
+        case 'i': case 'I':
+          if (!e.shiftKey) break;
+          propsRef.current.onRecordSegment?.({
+            type: 'opening',
+            start: 0,
+            end: round1(current.currentTime),
+          });
+          e.preventDefault();
+          break;
+        case 'o': case 'O':
+          if (!e.shiftKey) break;
+          propsRef.current.onRecordSegment?.({
+            type: 'ending',
+            start: round1(current.currentTime),
+            end: -1,
+          });
+          e.preventDefault();
+          break;
+        case 's': case 'S':
+          if (!e.shiftKey) break;
+          propsRef.current.onPendingStart(round1(current.currentTime));
+          showHint('片段起点已记录，播放到终点后按 Shift+E');
+          e.preventDefault();
+          break;
+        case 'e': case 'E': {
+          if (!e.shiftKey) break;
+          const start = propsRef.current.pendingStart;
+          if (start === null) {
+            showHint('请先按 Shift+S 记录片段起点');
+          } else {
+            const end = round1(current.currentTime);
+            propsRef.current.onPendingStart(null);
+            propsRef.current.onRecordSegment?.({ type: 'middle', start, end });
+          }
+          e.preventDefault();
+          break;
+        }
       }
     };
     document.addEventListener('keydown', shortcuts);
@@ -573,7 +879,7 @@ export function PlayerShell({
 
     // 卸载与页面隐藏时保存进度
     const saveOnHide = () => {
-      if (document.visibilityState === 'hidden') {
+      if (document.visibilityState === 'hidden' && !endedRef.current) {
         propsRef.current.onPause?.(art.currentTime, art.duration);
       }
     };
@@ -590,6 +896,7 @@ export function PlayerShell({
       document.removeEventListener('keydown', shortcuts);
       document.removeEventListener('visibilitychange', saveOnHide);
       if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+      if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
       el?.removeEventListener('touchstart', onTouchStart);
       el?.removeEventListener('touchend', onTouchEnd);
       el?.removeEventListener('touchcancel', onTouchEnd);
@@ -606,6 +913,8 @@ export function PlayerShell({
       hlsRef.current = null;
       recoveryRef.current?.dispose();
       getVideoPrefetcher().stop();
+      // 播放页可能仍持有读取接口：销毁前显式置空，避免「记录当前」读到已销毁实例
+      propsRef.current.onPlayerApi?.(null);
       art.destroy();
       artRef.current = null;
     };
@@ -626,6 +935,23 @@ export function PlayerShell({
       style: { opacity: hasNextEpisode ? '1' : '0.4', pointerEvents: hasNextEpisode ? 'auto' : 'none' },
     });
   }, [hasPrevEpisode, hasNextEpisode, url]);
+
+  // —— 标记变化：重置采样基准并立即刷新提示 ——
+  // 刚写入片段时当前时间可能恰好等于新边界，若沿用上一拍采样会被判成
+  // 「连续越过」而当场触发；把基准拉平后本集只保留手动按钮，下一集才自动。
+  // 顺带覆盖暂停中修改标记的场景（没有 timeupdate 也要让按钮即时出现/消失）。
+  useEffect(() => {
+    const art = artRef.current;
+    if (!art) return;
+    const current = art.currentTime;
+    lastSampleRef.current = Number.isFinite(current) ? current : 0;
+    const segments = resolveSegments(skipMark, art.duration);
+    const active = findActiveSegment(segments, current);
+    const prompt =
+      active && !handledSegmentsRef.current.has(segmentKey(active)) ? active : null;
+    updateSkipPrompt(prompt);
+    renderSkipMarks();
+  }, [skipMark]);
 
   // —— 换集：仅切换 HLS 源，不重建播放器（保留网页全屏等状态） ——
   const firstUrlRef = useRef(true);
@@ -661,6 +987,31 @@ export function PlayerShell({
           }}
         />
       )}
+      {!error && skipPrompt && (
+        <button
+          type="button"
+          className="absolute bottom-16 left-1/2 -translate-x-1/2 z-10 rounded-full bg-black/70 px-4 py-2 text-sm text-white transition-colors hover:bg-black/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          onClick={() => {
+            if (skipPrompt.type === 'ending') {
+              finishBySkip(skipPrompt);
+              return;
+            }
+            const from = artRef.current?.currentTime ?? 0;
+            if (skipTo(skipPrompt.end)) {
+              handledSegmentsRef.current.add(segmentKey(skipPrompt));
+              rememberSkip(from, skipPrompt);
+              updateSkipPrompt(null);
+              showHint(skipPrompt.type === 'opening' ? '已跳过片头' : '已跳过中段');
+            }
+          }}
+        >
+          {skipPrompt.type === 'ending'
+            ? '跳过片尾'
+            : skipPrompt.type === 'opening'
+              ? '跳过片头'
+              : '跳过中段'}
+        </button>
+      )}
       {error && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/80">
           <p className="text-danger text-sm">{error}</p>
@@ -669,9 +1020,21 @@ export function PlayerShell({
           </button>
         </div>
       )}
-      {hint && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-black/70 text-white text-sm px-3 py-1.5 rounded-full pointer-events-none animate-fade-in">
-          {hint}
+      {(hint || undoSkip) && (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-full bg-black/70 px-3 py-1.5 text-sm text-white animate-fade-in">
+          {/* 撤销窗口比普通提示长：hint 已淡出时仍要让用户知道刚才跳过了什么 */}
+          <span className="pointer-events-none">
+            {hint || (undoSkip ? `已跳过${SEGMENT_LABELS[undoSkip.segment.type]}` : '')}
+          </span>
+          {undoSkip && (
+            <button
+              type="button"
+              className="pointer-events-auto shrink-0 rounded-full bg-white/20 px-2 py-0.5 text-xs font-medium transition-colors hover:bg-white/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              onClick={undoLastSkip}
+            >
+              撤销
+            </button>
+          )}
         </div>
       )}
       {autoplayNext && !error && (

@@ -17,7 +17,7 @@ LibreTV Next.js 迁移版：免费在线视频聚合搜索与观看平台。基�
 
 - **聚合搜索**：多采集站服务端并行搜索
 - **跨源同名聚合**：同名影片合并为一张卡片，展开即可比较和选择各来源
-- **HLS 播放**：ArtPlayer + hls.js，广告分片过滤、自动连播、倍速、快捷键、移动端长按 3 倍速
+- **HLS 播放**：ArtPlayer + hls.js，广告分片过滤、跳过片段（片头/中段/片尾标记与自动跳过）、自动连播、倍速、快捷键、移动端长按 3 倍速
 - **直播 / IPTV**：M3U 订阅解析，`/live` 页面按分组浏览、搜索频道并站内播放（HLS + HTTP-FLV），支持 XMLTV 节目单（EPG）与频道收藏；直播流经专用长连接代理（`/api/live/stream`）转发
 - **进度同步**：播放进度与观看历史存于本机 IndexedDB，精确到秒的续播
 - **换源测速**：跨源搜索同名资源并测速排序，一键切换保留集数位置
@@ -107,7 +107,7 @@ PASSWORD=your-password npm start   # 监听 8080
 
 1. **添加点播源**：设置 → 源管理 → 点播源 → 添加 API，填入 Apple CMS 采集站地址（如 `https://example.com/api.php/provide/vod`），可选填详情页地址（部分源需要爬详情页提取播放地址）。
 2. **搜索**：勾选点播源后输入片名；搜索通过服务端聚合，个别源失败不影响整体结果。
-3. **播放**：详情弹窗选择剧集进入 `/watch`；支持快捷键（空格/←→/↑↓/F/Alt+←→）、移动端长按 3 倍速、自动连播、换源测速。观看/暂停时后续分片自动缓存到本地（设置可关），播放页可「下载本集」（TS/MP4）离线观看。
+3. **播放**：详情弹窗选择剧集进入 `/watch`；支持快捷键（空格/←→/↑↓/F/Alt+←→）、移动端长按 3 倍速、自动连播、换源测速。观看/暂停时后续分片自动缓存到本地（设置可关），播放页可「下载本集」（TS/MP4）离线观看。播放页「跳过标记」可标记片头/中段/片尾区间（快捷键 Shift+I 片头结束、Shift+O 片尾开始、Shift+S·Shift+E 中段区间），之后同剧各集与同名资源自动跳过——片头/中段跳到片段末尾，片尾则直接结束本集（是否连播下一集由自动连播决定），三类片段共用「自动跳过片段」一个开关；跳过时提示条带「撤销」，「跳过标记」侧栏可逐剧关闭、微调边界、试跳起点/终点（记录与试跳都会先暂停），命中区间在进度条上着色。侧栏是非模态的：不遮画面、不挡播放器点击，可以一边看一边标。
 4. **进度与历史**：自动保存在本设备 IndexedDB，仅定位信息入库，播放时自动同步最新剧集。
 5. **配置迁移**：设置 → 数据 → 配置导入导出（兼容旧版 LibreTV-Settings JSON 的历史记录迁移）。
 
@@ -236,6 +236,10 @@ CI 校验通过后自动构建并推送 `ghcr.io/librespark/libretv:<版本>`（
 | [Joyflix](https://github.com/jeffernn/Joyflix-Mac-Objective-C) | macOS 原生影视聚合客户端（Objective-C） |
 | [MoonCakeTV](https://github.com/MoonCakeTV/MoonCakeTV) | 影视聚合搜索站（Next.js），文件存储、一键脚本部署 |
 | [OrangeTV](https://github.com/djteang/OrangeTV) | 跨平台影视聚合播放器（Next.js），Kvrocks/Redis/Upstash 多存储与多端同步 |
+| [MQTV](https://github.com/MaoLikeQvQ/MQTV) | 重构与优化 LibreTV |
+| [NextTV](https://github.com/SeqCrafter/NextTV) | 影视聚合站（Next.js + Zustand），支持弹幕 |
+| [DpadTV](https://github.com/AresCNZJ/DpadTV) | Android TV 原生客户端（Kotlin + Media3/ExoPlayer），对接自建服务端，不依赖 WebView |
+| [LibreTV-for-HarmonyOS](https://github.com/panhaichen-creator/LibreTV-for-HarmonyOS) | HarmonyOS NEXT 原生客户端（ArkTS + ArkUI + AVPlayer） |
 
 > 旧版 LibreTV（静态 HTML + Express）完整代码见 [backup-2025 分支](https://github.com/LibreSpark/LibreTV/tree/backup-2025)。
 

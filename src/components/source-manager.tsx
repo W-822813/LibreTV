@@ -558,6 +558,9 @@ function VodSourceRow({
 
 function PlaybackPanel() {
   const store = useAppStore();
+  const { toast } = useToast();
+  const [clearMarksOpen, setClearMarksOpen] = useState(false);
+  const markCount = Object.keys(store.skipMarks).length;
   return (
     <section>
       <SectionTitle title="播放与过滤" />
@@ -574,7 +577,40 @@ function PlaybackPanel() {
           checked={store.autoplayNext}
           onChange={(v) => store.updateSettings({ autoplayNext: v })}
         />
+        <ToggleRow
+          label="自动跳过片段"
+          description="命中片头/中段标记时跳到片段末尾，命中片尾标记时结束本集（是否连播下一集由「自动连播」决定）；关闭后三类都只显示跳过按钮（标记在播放页「跳过标记」中设置）"
+          checked={store.autoSkipSegments}
+          onChange={(v) => store.updateSettings({ autoSkipSegments: v })}
+        />
       </div>
+
+      {markCount > 0 && (
+        <div className="flex items-center justify-between gap-3 pt-3 mt-3 border-t border-line">
+          <div className="min-w-0">
+            <div className="text-sm text-content">跳过片段标记</div>
+            <div className="text-xs text-faint">已记录 {markCount} 部；在播放页「跳过标记」中设置，可逐剧关闭</div>
+          </div>
+          <button className="btn-ghost btn-sm shrink-0" onClick={() => setClearMarksOpen(true)}>
+            清除全部
+          </button>
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={clearMarksOpen}
+        danger
+        title="清除全部跳过片段？"
+        message={`将删除已记录的 ${markCount} 部剧的跳过片段，之后播放不再自动跳过；可重新在播放页标记。`}
+        confirmLabel="清除全部"
+        onCancel={() => setClearMarksOpen(false)}
+        onConfirm={() => {
+          store.clearAllSkipMarks();
+          setClearMarksOpen(false);
+          toast('已清除全部跳过片段标记', 'success');
+        }}
+      />
+
       <VideoCachePanel />
     </section>
   );

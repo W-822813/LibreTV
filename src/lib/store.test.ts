@@ -25,6 +25,7 @@ beforeEach(() => {
     liveFavorites: [],
     liveRecent: [],
     yellowFilter: false,
+    skipMarks: {},
   });
 });
 
@@ -388,5 +389,63 @@ describe('订阅整体开关', () => {
     expect(isInDisabledSubscription(store(), `${subKeyPrefix(subUrl)}_1`)).toBe(true);
     expect(isInDisabledSubscription(store(), `${subKeyPrefix(otherUrl)}_1`)).toBe(false);
     expect(isInDisabledSubscription(store(), 'manual_0')).toBe(false);
+  });
+});
+
+describe('跳过片段标记', () => {
+  beforeEach(() => {
+    useAppStore.setState({ skipMarks: {} });
+  });
+
+  it('写入片段列表并刷新 updatedAt', () => {
+    store().setSkipMark('t:abc', [{ type: 'opening', start: 0, end: 45 }]);
+    expect(store().skipMarks['t:abc']?.segments).toEqual([{ type: 'opening', start: 0, end: 45 }]);
+    const firstUpdatedAt = store().skipMarks['t:abc']?.updatedAt ?? 0;
+    expect(firstUpdatedAt).toBeGreaterThan(0);
+
+    store().setSkipMark('t:abc', [
+      { type: 'opening', start: 0, end: 45 },
+      { type: 'ending', start: 1200, end: -1 },
+    ]);
+    expect(store().skipMarks['t:abc']?.segments).toHaveLength(2);
+    expect(store().skipMarks['t:abc']?.updatedAt).toBeGreaterThanOrEqual(firstUpdatedAt);
+  });
+
+  it('写入空数组删除整条，不创建空壳条目', () => {
+    store().setSkipMark('t:abc', [{ type: 'opening', start: 0, end: 45 }]);
+    store().setSkipMark('t:abc', []);
+    expect(store().skipMarks['t:abc']).toBeUndefined();
+
+    store().setSkipMark('t:missing', []);
+    expect(store().skipMarks).toEqual({});
+  });
+
+  it('写入时默认开启本剧跳过，改片段不会重置已关闭状态', () => {
+    store().setSkipMark('t:abc', [{ type: 'opening', start: 0, end: 45 }]);
+    expect(store().skipMarks['t:abc']?.enabled).toBe(true);
+
+    store().setSkipMarkEnabled('t:abc', false);
+    expect(store().skipMarks['t:abc']?.enabled).toBe(false);
+
+    // 修一条标错的边界后，用户"关掉本剧"的选择要保留
+    store().setSkipMark('t:abc', [{ type: 'opening', start: 0, end: 30 }]);
+    expect(store().skipMarks['t:abc']?.enabled).toBe(false);
+  });
+
+  it('setSkipMarkEnabled 对不存在的条目无副作用', () => {
+    store().setSkipMarkEnabled('t:missing', false);
+    expect(store().skipMarks).toEqual({});
+  });
+
+  it('clearSkipMark 只删指定条目，clearAllSkipMarks 清空全部', () => {
+    store().setSkipMark('t:a', [{ type: 'opening', start: 0, end: 20 }]);
+    store().setSkipMark('t:b', [{ type: 'ending', start: 200, end: -1 }]);
+
+    store().clearSkipMark('t:a');
+    expect(store().skipMarks).not.toHaveProperty('t:a');
+    expect(store().skipMarks).toHaveProperty('t:b');
+
+    store().clearAllSkipMarks();
+    expect(store().skipMarks).toEqual({});
   });
 });

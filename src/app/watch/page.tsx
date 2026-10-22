@@ -17,6 +17,10 @@ const PlayerShell = dynamic(() => import('@/components/player-shell').then((m) =
 });
 import { EmptyState, LoadingState, Spinner } from '@/components/states';
 import { SwitchSourceModal } from '@/components/switch-source';
+import { SkipMarkPanel } from '@/components/skip-mark-panel';
+import { skipMarkKey, validateSegment, type SkipSegment } from '@/lib/skip-marks';
+import type { PlayerSkipApi } from '@/components/player-shell';
+import { useToast } from '@/components/toast';
 import { enqueueDownload } from '@/components/download-manager';
 import { Icon } from '@/components/icon';
 import { useAuth } from '@/components/auth';
@@ -50,6 +54,7 @@ function WatchContent() {
   const router = useRouter();
   const store = useAppStore();
   const { verified } = useAuth();
+  const { toast } = useToast();
 
   const sourceKey = searchParams.get('source') || '';
   const vodId = searchParams.get('id') || '';
@@ -59,6 +64,40 @@ function WatchContent() {
 
   const [reversed, setReversed] = useState(false);
   const [switchOpen, setSwitchOpen] = useState(false);
+  const [skipPanelOpen, setSkipPanelOpen] = useState(false);
+  // 播放器对外暴露的精确时间读取接口（「记录当前」用），随播放器卸载置空
+  const playerApiRef = useRef<PlayerSkipApi | null>(null);
+  // 播放框：小屏「跳过标记」抽屉要按它的底边算剩余高度，避免压住画面
+  const playerFrameRef = useRef<HTMLDivElement | null>(null);
+  const [sheetMaxHeight, setSheetMaxHeight] = useState<number | undefined>(undefined);
+
+  useEffect(() => {
+    if (!skipPanelOpen) return;
+    const measure = () => {
+      // 桌面端抽屉贴右侧、整屏高，不受播放器位置影响
+      if (window.matchMedia('(min-width: 1024px)').matches) {
+        setSheetMaxHeight(undefined);
+        return;
+      }
+      const box = playerFrameRef.current?.getBoundingClientRect();
+      if (!box) {
+        setSheetMaxHeight(undefined);
+        return;
+      }
+      const viewport = window.visualViewport?.height ?? window.innerHeight;
+      const room = viewport - box.bottom - 12;
+      // 不超过视口 60%；矮窗下最多压到 160px，再小就没法用了
+      setSheetMaxHeight(Math.round(Math.max(160, Math.min(viewport * 0.6, room))));
+    };
+    measure();
+    // 只在打开与尺寸变化时测：跟着滚动实时改高度会让抽屉边滚边长，很晃
+    window.addEventListener('resize', measure);
+    window.visualViewport?.addEventListener('resize', measure);
+    return () => {
+      window.removeEventListener('resize', measure);
+      window.visualViewport?.removeEventListener('resize', measure);
+    };
+  }, [skipPanelOpen]);
 
   const source = resolveSource(store, sourceKey, {
     url: searchParams.get('sourceUrl') || undefined,
@@ -89,6 +128,21 @@ function WatchContent() {
     if (episodes.length > 0) return Math.min(Math.max(indexParam, 0), episodes.length - 1);
     return indexParam;
   }, [episodes, indexParam]);
+
+  // 跳过片段按剧名记忆：换集不变，换源到同名资源也能命中。
+  // 标题缺失（直连链接）时退回 source:vodId，至少保证本源本片可用。
+  const skipMarkFallback = `${sourceKey}:${vodId || currentUrl}`;
+  const markKey = useMemo(
+    () => skipMarkKey(videoTitle, skipMarkFallback),
+    [videoTitle, skipMarkFallback]
+  );
+  const skipMark = store.skipMarks[markKey];
+  const markedCount = skipMark?.segments.length ?? 0;
+
+  // 中段两步态的起点：页面层持有，面板按钮与 Shift+S/E 共用同一份状态
+  const [pendingStart, setPendingStart] = useState<number | null>(null);
+  // 换集清空中段两步态：起点属于上一集，不能和新集的位置拼成区间
+  useEffect(() => setPendingStart(null), [sourceKey, vodId, currentIndex]);
 
   const goEpisode = useCallback(
     (index: number) => {
@@ -154,6 +208,31 @@ function WatchContent() {
       autoNextTimer.current = setTimeout(() => goEpisode(currentIndex + 1), 800);
     }
   }, [store.autoplayNext, currentIndex, episodes.length, goEpisode, sourceKey, vodId]);
+
+  // 快捷键（Shift+I/O/S/E）记录片段：校验后写入
+  const handleRecordSegment = useCallback(
+    (segment: SkipSegment) => {
+      const duration = playerApiRef.current?.getDuration() ?? 0;
+      const existing = useAppStore.getState().skipMarks[markKey]?.segments ?? [];
+      const error = validateSegment(segment, duration, existing);
+      if (error) {
+        toast(error, 'error');
+        return;
+      }
+      useAppStore.getState().setSkipMark(markKey, [...existing, segment]);
+      const label =
+        segment.type === 'opening' ? '片头结束' : segment.type === 'ending' ? '片尾开始' : '中段片段';
+      // 中段命中时的表现取决于全局「自动跳过片段」，记完就说清楚，避免"标了却没反应"
+      const hint =
+        segment.type === 'middle'
+          ? useAppStore.getState().autoSkipSegments
+            ? '，命中时将自动跳过'
+            : '，命中时显示跳过按钮'
+          : '';
+      toast(`已记录${label}${hint}`, 'success');
+    },
+    [markKey, toast]
+  );
 
   // Alt+←/→ 集数切换快捷键
   useEffect(() => {
@@ -235,13 +314,19 @@ function WatchContent() {
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-4">
         <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-4">
           <div>
-            <div className="aspect-video bg-black rounded-lg overflow-hidden">
+            <div ref={playerFrameRef} className="aspect-video bg-black rounded-lg overflow-hidden">
               {currentUrl ? (
                 <PlayerShell
                   url={currentUrl}
                   title={videoTitle}
                   adFilter={store.adFilter}
                   autoplayNext={store.autoplayNext}
+                  skipMark={skipMark}
+                  autoSkipSegments={store.autoSkipSegments}
+                  pendingStart={pendingStart}
+                  onPendingStart={setPendingStart}
+                  onPlayerApi={(api) => { playerApiRef.current = api; }}
+                  onRecordSegment={handleRecordSegment}
                   episodeKey={`${sourceKey}:${vodId}:${currentIndex}`}
                   nextUrl={currentIndex + 1 < episodes.length ? episodes[currentIndex + 1] : undefined}
                   nextEpisodeKey={currentIndex + 1 < episodes.length ? `${sourceKey}:${vodId}:${currentIndex + 1}` : undefined}
@@ -290,6 +375,22 @@ function WatchContent() {
               >
                 下一集
               </button>
+              <button
+                className={cn('btn-ghost btn-sm', skipPanelOpen && 'bg-chip text-content')}
+                aria-expanded={skipPanelOpen}
+                aria-haspopup="dialog"
+                onClick={() => setSkipPanelOpen((v) => !v)}
+                title={
+                  markedCount > 0
+                    ? `本剧已标记 ${markedCount} 段${skipMark?.enabled === false ? '（本剧跳过已关闭）' : ''}`
+                    : '标记片头 / 中段 / 片尾，供本剧各集自动跳过'
+                }
+              >
+                跳过标记{markedCount > 0 ? ` (${markedCount})` : ''}
+                {markedCount > 0 && skipMark?.enabled === false && (
+                  <span className="ml-1 inline-block size-1.5 rounded-full bg-faint" aria-label="本剧跳过已关闭" />
+                )}
+              </button>
               <label className="flex items-center gap-1.5 text-xs text-muted ml-auto cursor-pointer">
                 <input
                   type="checkbox"
@@ -300,6 +401,26 @@ function WatchContent() {
                 自动连播
               </label>
             </div>
+
+            <SkipMarkPanel
+              open={skipPanelOpen}
+              onClose={() => setSkipPanelOpen(false)}
+              markKey={markKey}
+              pendingStart={pendingStart}
+              onPendingStart={setPendingStart}
+              mobileMaxHeight={sheetMaxHeight}
+              getPlayerClock={() => {
+                const api = playerApiRef.current;
+                if (!api) return null;
+                return {
+                  currentTime: api.getCurrentTime(),
+                  duration: api.getDuration(),
+                  seek: (s) => api.seek(s),
+                  pause: () => api.pause(),
+                  isPaused: () => api.isPaused(),
+                };
+              }}
+            />
           </div>
 
           {/* 剧集侧栏 */}

@@ -45,7 +45,7 @@ export default function GlobalError({
         </button>
         {/* digest 用于线上日志定位，不含敏感信息，展示无妨 */}
         {error.digest && (
-          <p style={{ margin: 0, fontSize: 11, color: '#6b7f99' }}>错误编号：{error.digest}</p>
+          <p style={{ margin: 0, fontSize: 11, color: '#7a8ca6' }}>错误编号：{error.digest}</p>
         )}
       </body>
     </html>
